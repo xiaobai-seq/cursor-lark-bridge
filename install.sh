@@ -156,7 +156,7 @@ download_release() {
 
     local tmp
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
+    trap 'rm -rf "${tmp:-}"' EXIT
 
     log "  URL: $url"
     if ! curl -fsSL "$url" -o "$tmp/$archive"; then
@@ -188,7 +188,7 @@ build_from_source() {
     step "Building from source"
     local tmp
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
+    trap 'rm -rf "${tmp:-}"' EXIT
 
     log "  cloning https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
     if ! git clone --depth 1 "https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git" "$tmp/src" 2>&1; then
