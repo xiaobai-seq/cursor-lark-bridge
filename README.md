@@ -57,14 +57,18 @@ fb init
 This walks you through three steps:
 
 1. **`lark-cli` check** – confirms you can talk to Feishu.
-2. **`open_id`** – paste in your own Feishu `open_id`. Get it by logging in and
-   fetching your own profile:
+2. **`open_id`** – `fb init` calls `lark-cli contact +get-user` under the hood,
+   shows you the detected name / `open_id` / owning app, and asks for `[Y/n]`
+   confirmation. This guarantees the `open_id` was issued by the **same app**
+   the daemon will later use to send messages, preventing the
+   `open_id cross app` error.
+
+   Prerequisite: you've run `lark-cli auth login` once so `lark-cli` is
+   authenticated. If auto-detection fails (not logged in, network issue, etc.)
+   the prompt falls back to manual paste. You can also override up-front:
+
    ```bash
-   lark-cli auth login                      # first time only — OAuth device flow
-   lark-cli contact +get-user               # prints JSON; look for data.user.open_id
-   # one-liner:
-   lark-cli contact +get-user \
-     | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['user']['open_id'])"
+   fb init --open-id ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --force
    ```
 3. **`hooks.json` merge** – shows you a diff, backs up the original, and writes `~/.cursor/hooks.json` with the new entries. Your existing hooks are preserved.
 
@@ -136,6 +140,7 @@ At runtime the installer lays things out under:
 |---|---|
 | `未找到 config.json` on `fb start` | run `fb init` first |
 | Feishu receives no cards | `fb status` — is `event subscribe` running? If not, check `lark-cli auth login` (daemon runs it as bot). |
+| `HTTP 400: open_id cross app` in `daemon.log` | The `open_id` in `config.json` was issued by a different app than the one `lark-cli` is currently bound to. Re-run `fb init --force` to auto-detect the correct value. |
 | Cards arrive, buttons don't resolve | inspect `~/.cursor/cursor-lark-bridge/daemon.log` — usually a lark-cli scope / permission issue |
 | `fb` not found in shell | add `~/.local/bin` to `PATH` |
 | `command not found: lark-cli` | install it first: https://github.com/larksuite/lark-cli |

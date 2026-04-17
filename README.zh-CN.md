@@ -57,14 +57,16 @@ fb init
 会带你过三步：
 
 1. **lark-cli 检查** – 确认你已能跟飞书通信。
-2. **open_id 输入** – 粘贴你自己的飞书 `open_id`。获取方式：先 OAuth 登录，
-   再查询自己的信息：
+2. **open_id 自动探测** – `fb init` 会自动调 `lark-cli contact +get-user`，
+   展示你的姓名 / `open_id` / 所属应用 ID，让你 `[Y/n]` 确认。这样可以保证
+   `open_id` 和 daemon 发消息用的是**同一个应用**，从源头避免
+   `open_id cross app` 报错。
+
+   前置条件：你已经跑过 `lark-cli auth login` 完成 OAuth 登录。如果自动探测
+   失败（未登录、网络异常等），会降级到手工粘贴。也可以直接命令行传入：
+
    ```bash
-   lark-cli auth login                      # 第一次使用才需要，走设备码 OAuth
-   lark-cli contact +get-user               # 输出 JSON，data.user.open_id 即是
-   # 一行拿 open_id：
-   lark-cli contact +get-user \
-     | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['user']['open_id'])"
+   fb init --open-id ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --force
    ```
 3. **合并 hooks.json** – 展示 diff，备份原文件，把新的 hook 条目写进 `~/.cursor/hooks.json`。你已有的 hook 会原样保留。
 
@@ -136,6 +138,7 @@ cursor-lark-bridge/
 |---|---|
 | `fb start` 报 `未找到 config.json` | 先跑 `fb init` |
 | 飞书收不到卡片 | 执行 `fb status`，看"事件订阅"是否在跑；若没有，检查 `lark-cli auth login`（daemon 会以 bot 身份订阅） |
+| `daemon.log` 里出现 `HTTP 400: open_id cross app` | `config.json` 里的 `open_id` 和 `lark-cli` 当前绑定的应用不是同一个。跑 `fb init --force` 让脚本在当前应用下重新取一次 |
 | 卡片到了但按钮点了没反应 | 看 `~/.cursor/cursor-lark-bridge/daemon.log`，大概率是 lark-cli scope / 权限问题 |
 | `fb` 命令找不到 | 把 `~/.local/bin` 加到 `PATH` |
 | `command not found: lark-cli` | 先装 lark-cli: https://github.com/larksuite/lark-cli |

@@ -233,35 +233,98 @@ step_lark_cli_check() {
 }
 
 step_collect_open_id() {
-    local flag="$1" force="$2" open_id
-    echo -e "${BLUE}━ Step 2 / 3 · 设置接收消息的 open_id ━━━━━━━━${NC}"
-    echo "如何获取你的 open_id（先登录，再取自己的信息）："
-    echo -e "  ${CYAN}lark-cli auth login${NC}"
-    echo -e "  ${CYAN}lark-cli contact +get-user | python3 -c \"import sys,json;print(json.load(sys.stdin)['data']['user']['open_id'])\"${NC}"
-    echo ""
+    local flag="$1" force="$2"
+    local open_id="" user_name="" app_id=""
 
-    if [ -n "$flag" ]; then
-        open_id="$flag"
-    elif [ -f "$BRIDGE_DIR/config.json" ] && [ "$force" = "0" ]; then
+    echo -e "${BLUE}━ Step 2 / 3 · 配置接收消息的 open_id ━━━━━━━━${NC}"
+
+    # 情形 A：已存在 config.json 且未 --force、未 --open-id ——保留不动
+    if [ -z "$flag" ] && [ -f "$BRIDGE_DIR/config.json" ] && [ "$force" = "0" ]; then
         local current
         current=$(python3 -c "import json; print(json.load(open('$BRIDGE_DIR/config.json')).get('open_id','<empty>'))" 2>/dev/null || echo '<invalid>')
         echo -e "  ${YELLOW}⚠${NC} 已存在 config.json（当前 open_id: $current）"
         echo -e "     要覆盖请加 ${CYAN}--force${NC}"
         echo ""
         return 0
-    else
-        read -r -p "? 粘贴你的 open_id: " open_id
     fi
 
-    # 软校验（不过只警告不阻断）
+    # 情形 B：命令行直接指定 --open-id
+    if [ -n "$flag" ]; then
+        open_id="$flag"
+        echo -e "  ${CYAN}ℹ${NC} 使用命令行指定的 open_id：$open_id"
+    else
+        # 情形 C：自动探测 lark-cli 当前身份 → 取 open_id
+        echo "  尝试从 lark-cli 自动探测（保证 open_id 与 daemon 发消息用的应用一致，避免 'open_id cross app'）..."
+
+        if command -v lark-cli >/dev/null 2>&1; then
+            # 当前 lark-cli 绑定的应用 ID（非致命，取不到不阻断）
+            app_id=$(lark-cli auth scopes 2>/dev/null | grep -oE 'cli_[a-z0-9]+' | head -1 || true)
+
+            # 当前登录用户在这个应用下的 profile
+            local profile
+            profile=$(lark-cli contact +get-user 2>/dev/null || true)
+            if [ -n "$profile" ]; then
+                open_id=$(printf '%s' "$profile" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('data', {}).get('user', {}).get('open_id', ''))
+except Exception:
+    pass
+" 2>/dev/null || true)
+                user_name=$(printf '%s' "$profile" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    u = d.get('data', {}).get('user', {})
+    print(u.get('name') or u.get('en_name') or '')
+except Exception:
+    pass
+" 2>/dev/null || true)
+            fi
+        fi
+
+        local auto_ok=0
+        if [ -n "$open_id" ]; then
+            auto_ok=1
+            echo ""
+            echo -e "  ${GREEN}✓${NC} 已探测到飞书身份："
+            [ -n "$user_name" ] && echo -e "      姓名     : $user_name"
+            echo -e "      open_id  : $open_id"
+            [ -n "$app_id" ]   && echo -e "      所属应用 : $app_id"
+            echo ""
+            local yn
+            read -r -p "? 使用这个 open_id 吗？[Y/n]: " yn
+            case "$yn" in
+                n|N|no|No|NO) open_id="" ;;  # 用户否决 → 回落到手工粘贴
+            esac
+        fi
+
+        # 情形 D：自动失败 or 用户否决 → 手工粘贴
+        if [ -z "$open_id" ]; then
+            echo ""
+            if [ "$auto_ok" = "1" ]; then
+                echo -e "  ${CYAN}ℹ${NC} 已放弃自动探测结果，请手动粘贴一个 open_id："
+            else
+                echo -e "  ${YELLOW}⚠${NC} 无法自动探测（可能未跑过 ${CYAN}lark-cli auth login${NC}）。请手动粘贴："
+                echo -e "     ${CYAN}lark-cli auth login${NC}                  # 第一次用需要 OAuth 登录"
+                echo -e "     ${CYAN}lark-cli contact +get-user${NC}           # 输出 JSON 里 data.user.open_id 就是"
+            fi
+            echo ""
+            read -r -p "? 粘贴你的 open_id: " open_id
+        fi
+    fi
+
+    # 软校验（只警告不阻断）
     if ! echo "$open_id" | grep -qE '^ou_[a-f0-9]{32}$'; then
         echo -e "  ${YELLOW}⚠${NC} '$open_id' 不像标准的 ou_[32 hex] 格式，已保存但请核对"
     fi
 
-    python3 -c "
-import json
-json.dump({'open_id': '$open_id'}, open('$BRIDGE_DIR/config.json', 'w'), indent=2)
-print()
+    OPEN_ID="$open_id" python3 -c "
+import json, os
+json.dump({'open_id': os.environ['OPEN_ID']},
+          open(os.environ['HOME'] + '/.cursor/cursor-lark-bridge/config.json', 'w'),
+          indent=2)
 " > /dev/null
     echo -e "  ${GREEN}✓${NC} 已保存到 $BRIDGE_DIR/config.json"
     echo ""

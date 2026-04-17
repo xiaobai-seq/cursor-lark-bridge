@@ -1,4 +1,4 @@
 {
-  "_comment": "Fill in your Feishu open_id. Get it with: lark-cli auth login && lark-cli contact +get-user (look at data.user.open_id)",
+  "_comment": "This file is normally written by `fb init` (auto-detects via lark-cli contact +get-user). Only edit manually if you know what you're doing — the open_id MUST come from the same Feishu app that lark-cli is currently bound to (see `lark-cli auth scopes`), otherwise you'll hit 'open_id cross app'.",
   "open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 }
