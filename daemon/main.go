@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -57,7 +58,14 @@ type Daemon struct {
 	pending   map[string]*pendingEntry
 	pendingMu sync.Mutex
 	reqSeq    atomic.Int64
-	eventCmd  *exec.Cmd
+
+	// 事件订阅子进程（lark-cli event +subscribe）相关状态
+	// eventCmdMu 保护 eventCmd 的并发读写，避免 HTTP handler / 订阅循环之间踩踏
+	eventCmdMu   sync.Mutex
+	eventCmd     *exec.Cmd
+	lastEventAt  atomic.Int64 // UnixMilli，最近一次收到事件流输出的时间
+	subscribeOK  atomic.Bool  // 当前 lark-cli 子进程是否成功稳定订阅（启动后 2s 仍未退出即视为 OK）
+	restartCount atomic.Int64 // 累计的 lark-cli 重启次数（诊断用）
 }
 
 // ── 事件解析 ──
@@ -142,11 +150,19 @@ type ModeResponse struct {
 	Active bool `json:"active"`
 }
 
+// HealthResponse 暴露 daemon 的真实健康度
+//   - EventRunning: lark-cli 子进程当前是否存活（仅证明进程在跑，不保证订阅健康）
+//   - SubscribeOK:  本次 lark-cli 启动是否稳定订阅上（成功超过 2s 视为 OK）
+//   - LastEventAgeMs: 距离上一次收到事件流输出的毫秒数；-1 表示启动至今未收到任何事件
+//   - RestartCount: 累计 lark-cli 重启次数，持续增长说明在无限重启循环
 type HealthResponse struct {
-	Status       string `json:"status"`
-	Active       bool   `json:"active"`
-	EventRunning bool   `json:"event_running"`
-	Version      string `json:"version"`
+	Status         string `json:"status"`
+	Active         bool   `json:"active"`
+	EventRunning   bool   `json:"event_running"`
+	SubscribeOK    bool   `json:"subscribe_ok"`
+	LastEventAgeMs int64  `json:"last_event_age_ms"`
+	RestartCount   int64  `json:"restart_count"`
+	Version        string `json:"version,omitempty"`
 }
 
 // ── 初始化 ──
@@ -199,12 +215,41 @@ func (d *Daemon) saveState() {
 	os.WriteFile(filepath.Join(d.baseDir, stateFileName), data, 0644)
 }
 
-func (d *Daemon) writePID() {
-	os.WriteFile(filepath.Join(d.baseDir, pidFileName), []byte(strconv.Itoa(os.Getpid())), 0644)
+// acquirePIDLock 检查是否已有活 daemon，没有则写入自己的 PID
+// 返回非 nil error 时 daemon 必须退出，防止并发启动互相踩（例如同时启动会清理对方的 lark-cli 子进程）
+func (d *Daemon) acquirePIDLock() error {
+	p := filepath.Join(d.baseDir, pidFileName)
+	if data, err := os.ReadFile(p); err == nil {
+		pidStr := strings.TrimSpace(string(data))
+		if pidStr != "" {
+			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 && pid != os.Getpid() {
+				if proc, err := os.FindProcess(pid); err == nil {
+					// Signal(0) 不实际发信号，仅探测进程是否存活
+					if proc.Signal(syscall.Signal(0)) == nil {
+						return fmt.Errorf("另一个 daemon 已在运行 (PID=%d)，请先 `fb kill` 再启动", pid)
+					}
+				}
+			}
+		}
+	}
+	// 写入当前 PID；目录不存在时先创建，避免 PID 文件写入失败
+	if err := os.MkdirAll(d.baseDir, 0755); err != nil {
+		return fmt.Errorf("创建 %s 失败: %w", d.baseDir, err)
+	}
+	return os.WriteFile(p, []byte(strconv.Itoa(os.Getpid())), 0644)
 }
 
 func (d *Daemon) removePID() {
-	os.Remove(filepath.Join(d.baseDir, pidFileName))
+	// 仅在 PID 文件里记录的仍是自己时才删除，防止并发重启下覆盖掉后来者的 PID
+	p := filepath.Join(d.baseDir, pidFileName)
+	if data, err := os.ReadFile(p); err == nil {
+		if pidStr := strings.TrimSpace(string(data)); pidStr != "" {
+			if pid, err := strconv.Atoi(pidStr); err == nil && pid != os.Getpid() {
+				return
+			}
+		}
+	}
+	os.Remove(p)
 }
 
 func (d *Daemon) nextRequestID(prefix string) string {
@@ -218,8 +263,22 @@ func (d *Daemon) isActive() bool {
 }
 
 // ── 事件订阅：同时监听消息 + 卡片按钮点击 ──
+//
+// 设计要点（v0.1.5 起）：
+//  1. 子进程放进独立 process group（Setpgid=true），daemon 退出时对整个 pgroup
+//     发 SIGTERM→SIGKILL，避免 lark-cli 的 node 父壳死了、孙子进程被 launchd 收养
+//     变成收黑洞事件的孤儿。
+//  2. daemon 启动前先 best-effort 清理一遍可能遗留的 lark-cli event 进程，
+//     防止上一次非正常退出留下的孤儿霸占"单 app 单订阅者"坑位。
+//  3. stderr 通过 pipe 同时写到 os.Stderr 和一个小内存 buffer；子进程退出后
+//     回看 stderr，如果是 "another event +subscribe instance is already running"
+//     这类冲突，就主动 pkill 一次再重启。
+//  4. 子进程启动后 2s 内未退出则 subscribeOK=true，用于 /health 真实健康判定。
 
 func (d *Daemon) startEventSubscription(ctx context.Context) {
+	// daemon 冷启动时先清一遍可能遗留的 lark-cli event 孤儿
+	cleanupStaleLarkCLIEvent("startup")
+
 	go func() {
 		for {
 			select {
@@ -227,30 +286,142 @@ func (d *Daemon) startEventSubscription(ctx context.Context) {
 				return
 			default:
 			}
-			logInfo("启动 lark-cli event +subscribe ...")
-			cmd := exec.CommandContext(ctx, "lark-cli", "event", "+subscribe",
-				"--event-types", "im.message.receive_v1,card.action.trigger",
-				"--compact", "--quiet", "--as", "bot")
-			d.eventCmd = cmd
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				logErr("创建 stdout pipe 失败: %v", err)
-				sleepCtx(ctx, 5*time.Second)
-				continue
-			}
-			cmd.Stderr = os.Stderr
-			if err := cmd.Start(); err != nil {
-				logErr("启动 lark-cli 失败: %v", err)
-				sleepCtx(ctx, 5*time.Second)
-				continue
-			}
-			logInfo("lark-cli event +subscribe 已启动 (PID=%d)", cmd.Process.Pid)
-			d.readEvents(ctx, stdout)
-			cmd.Wait()
-			logInfo("lark-cli event +subscribe 已退出，3 秒后重启...")
+			d.runOneSubscription(ctx)
 			sleepCtx(ctx, 3*time.Second)
 		}
 	}()
+}
+
+// runOneSubscription 启动一次 lark-cli event +subscribe 子进程并阻塞到它退出
+func (d *Daemon) runOneSubscription(ctx context.Context) {
+	logInfo("启动 lark-cli event +subscribe ...")
+	cmd := exec.CommandContext(ctx, "lark-cli", "event", "+subscribe",
+		"--event-types", "im.message.receive_v1,card.action.trigger",
+		"--compact", "--quiet", "--as", "bot")
+
+	// 独立 process group，daemon 退出时可以通过负 PID 一次端掉整条链
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		logErr("创建 stdout pipe 失败: %v", err)
+		return
+	}
+	// stderr 旁路到内存 buffer，退出后用来做错误分类
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = io.MultiWriter(os.Stderr, newCappedWriter(&stderrBuf, 8*1024))
+
+	if err := cmd.Start(); err != nil {
+		logErr("启动 lark-cli 失败: %v", err)
+		return
+	}
+	pid := cmd.Process.Pid
+	logInfo("lark-cli event +subscribe 已启动 (PID=%d)", pid)
+
+	d.eventCmdMu.Lock()
+	d.eventCmd = cmd
+	d.eventCmdMu.Unlock()
+	d.subscribeOK.Store(false)
+	d.restartCount.Add(1)
+
+	// 启动 2s 仍没退出，认为订阅已稳定建立（lark-cli 如果被服务端拒绝会立刻退出）
+	stableTimer := time.AfterFunc(2*time.Second, func() {
+		// 只在进程仍然活着时才标记 OK
+		if cmd.ProcessState == nil {
+			d.subscribeOK.Store(true)
+		}
+	})
+
+	d.readEvents(ctx, stdout)
+	cmd.Wait()
+	stableTimer.Stop()
+	d.subscribeOK.Store(false)
+
+	// 出错分类：冲突类错误需要主动清理再重试，否则纯死循环无意义
+	stderrStr := stderrBuf.String()
+	if strings.Contains(stderrStr, "already running") ||
+		strings.Contains(stderrStr, "Only one subscriber") {
+		logErr("检测到 lark-cli event 冲突（有遗留订阅者），主动清理后重试...")
+		cleanupStaleLarkCLIEvent("conflict")
+	}
+
+	logInfo("lark-cli event +subscribe 已退出，3 秒后重启...")
+}
+
+// cleanupStaleLarkCLIEvent 尽力清理可能遗留的 lark-cli event +subscribe 进程
+// reason 仅用于日志区分是启动清理还是冲突清理
+func cleanupStaleLarkCLIEvent(reason string) {
+	patterns := []string{
+		"lark-cli.*event .subscribe",
+		"@larksuite/cli.*event .subscribe",
+	}
+	cleaned := false
+	for _, p := range patterns {
+		// -9 保证即使子进程在 uninterruptible sleep / sigterm 被忽略时也能被清
+		if err := exec.Command("pkill", "-9", "-f", p).Run(); err == nil {
+			cleaned = true
+		}
+	}
+	if cleaned {
+		logInfo("[cleanup:%s] 已清理残留的 lark-cli event 进程", reason)
+	}
+}
+
+// killEventSubprocess 对 lark-cli 子进程组发 SIGTERM，3s 仍未退出则 SIGKILL
+// 用于 daemon 优雅退出路径，避免孤儿
+func (d *Daemon) killEventSubprocess() {
+	d.eventCmdMu.Lock()
+	cmd := d.eventCmd
+	d.eventCmdMu.Unlock()
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	// 负 PID 向整个 process group 发信号；Setpgid 时 pgid == pid
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	// 冗余一次向直接子进程发 SIGTERM，兼容 Setpgid 失败的场景
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+
+	done := make(chan struct{})
+	go func() {
+		// cmd.Wait 可能已被订阅循环调用，这里再 Wait 会返回 "Wait was already called"，
+		// 所以用轮询 Process.Signal(0) 判断进程是否消失
+		for {
+			if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+				close(done)
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+}
+
+// cappedWriter 限制 buffer 最多 max 字节，防止 stderr 无限增长吃内存
+type cappedWriter struct {
+	buf *bytes.Buffer
+	max int
+}
+
+func newCappedWriter(buf *bytes.Buffer, max int) io.Writer {
+	return &cappedWriter{buf: buf, max: max}
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	if c.buf.Len() >= c.max {
+		return len(p), nil
+	}
+	room := c.max - c.buf.Len()
+	if len(p) <= room {
+		return c.buf.Write(p)
+	}
+	c.buf.Write(p[:room])
+	return len(p), nil
 }
 
 func (d *Daemon) readEvents(ctx context.Context, r io.Reader) {
@@ -266,6 +437,9 @@ func (d *Daemon) readEvents(ctx context.Context, r io.Reader) {
 		if line == "" {
 			continue
 		}
+
+		// 任何事件进入都更新时间戳，用于 /health 的真实健康探针
+		d.lastEventAt.Store(time.Now().UnixMilli())
 
 		// 先解析 type 字段判断事件类型
 		var base struct {
@@ -471,8 +645,26 @@ func (d *Daemon) handleHealth(w http.ResponseWriter, r *http.Request) {
 	d.stateMu.RLock()
 	active := d.state.Active
 	d.stateMu.RUnlock()
-	eventRunning := d.eventCmd != nil && d.eventCmd.Process != nil && d.eventCmd.ProcessState == nil
-	writeJSON(w, HealthResponse{Status: "ok", Active: active, EventRunning: eventRunning, Version: version})
+
+	d.eventCmdMu.Lock()
+	cmd := d.eventCmd
+	d.eventCmdMu.Unlock()
+	eventRunning := cmd != nil && cmd.Process != nil && cmd.ProcessState == nil
+
+	lastAgeMs := int64(-1)
+	if last := d.lastEventAt.Load(); last > 0 {
+		lastAgeMs = time.Now().UnixMilli() - last
+	}
+
+	writeJSON(w, HealthResponse{
+		Status:         "ok",
+		Active:         active,
+		EventRunning:   eventRunning,
+		SubscribeOK:    d.subscribeOK.Load(),
+		LastEventAgeMs: lastAgeMs,
+		RestartCount:   d.restartCount.Load(),
+		Version:        version,
+	})
 }
 
 func (d *Daemon) handleMode(w http.ResponseWriter, r *http.Request) {
@@ -936,7 +1128,10 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 func main() {
 	logInfo("cursor-lark-bridge daemon 启动中... (version=%s)", version)
 	d := newDaemon()
-	d.writePID()
+	if err := d.acquirePIDLock(); err != nil {
+		logErr("%v", err)
+		os.Exit(1)
+	}
 	defer d.removePID()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -956,6 +1151,11 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 	logInfo("收到信号 %v，正在关闭...", sig)
+
+	// 先显式端掉 lark-cli 子进程组，避免 daemon 被 SIGKILL 时留下孤儿
+	// （SIGTERM 路径 ctx cancel 后 Go 也会 Kill 直接子进程，但对孙子进程不生效）
+	d.killEventSubprocess()
+
 	cancel()
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()

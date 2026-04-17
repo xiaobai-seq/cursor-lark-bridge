@@ -101,6 +101,66 @@ check_prereqs() {
     fi
 }
 
+# 检测老版 feishu-bridge 残留（项目 v0.1.0 之前叫这个名字）
+# 不做自动清理，避免误伤用户手动维护的老进程；给出明确指引后让用户决定
+#
+# 关键细节：pgrep -f 会匹配整条 cmdline，当某个 shell 脚本的参数里恰好带有
+# "feishu-bridge-daemon" 字符串（比如本脚本自己）时也会被命中——所以需要通过
+# ps -o comm= 过滤掉 basename 是 bash/sh/zsh 等解释器的候选 PID。
+check_legacy_feishu_bridge() {
+    step "Checking for legacy feishu-bridge (pre-rename) residue"
+
+    local candidates real_pids="" pid comm base
+    candidates=$(pgrep -f 'feishu-bridge-daemon|feishu-bridge/daemon' 2>/dev/null || true)
+    for pid in $candidates; do
+        [ "$pid" = "$$" ] && continue
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+        [ -z "$comm" ] && continue
+        base="${comm##*/}"
+        case "$base" in
+            bash|sh|zsh|fish|dash|ksh|pgrep|grep|ps|awk|sed|tr|wc|head|tail|xargs|cat|echo|curl) continue ;;
+        esac
+        real_pids+="${real_pids:+ }$pid"
+    done
+
+    local has_proc=0 has_dir=0
+    [ -n "$real_pids" ] && has_proc=1
+    [ -d "$HOME/.cursor/feishu-bridge" ] && has_dir=1
+
+    if [ "$has_proc" = "0" ] && [ "$has_dir" = "0" ]; then
+        ok "no legacy feishu-bridge residue"
+        return
+    fi
+
+    warn "Detected leftover from the old 'feishu-bridge' project (renamed to cursor-lark-bridge)."
+    if [ "$has_proc" = "1" ]; then
+        printf "    legacy process(es):\n"
+        for pid in $real_pids; do
+            ps -p "$pid" -o pid=,command= 2>/dev/null | sed 's/^/      /'
+        done
+    fi
+    if [ "$has_dir" = "1" ]; then
+        printf "    legacy directory: %s\n" "$HOME/.cursor/feishu-bridge"
+    fi
+    echo
+    warn "These will collide with cursor-lark-bridge on port 19836 and silently break it."
+    warn "Please clean up BEFORE continuing:"
+    [ "$has_proc" = "1" ] && log  "    ${CYAN}kill -9 $real_pids${NC}"
+    [ "$has_dir" = "1" ] && log  "    ${CYAN}rm -rf ~/.cursor/feishu-bridge${NC}    # optional"
+    echo
+    if [ -t 0 ] && [ -z "${CI:-}" ]; then
+        # 终端交互：给用户机会决定是否继续
+        printf "${YELLOW}Continue installation anyway? [y/N] ${NC}"
+        local ans=""
+        read -r ans || true
+        if [ "${ans:-n}" != "y" ] && [ "${ans:-n}" != "Y" ]; then
+            die "aborted by user"
+        fi
+    else
+        warn "not running interactively — will continue, but expect port-bind conflicts"
+    fi
+}
+
 # ─────────────────────────────────────────────
 # platform detection
 # ─────────────────────────────────────────────
@@ -300,6 +360,7 @@ main() {
 
     log "${BOLD}cursor-lark-bridge installer${NC}  (repo: ${GITHUB_USER}/${GITHUB_REPO})"
     check_prereqs
+    check_legacy_feishu_bridge
     detect_platform
 
     if [ "$BUILD_FROM_SOURCE" = "0" ]; then
