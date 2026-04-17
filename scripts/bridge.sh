@@ -235,8 +235,9 @@ step_lark_cli_check() {
 step_collect_open_id() {
     local flag="$1" force="$2" open_id
     echo -e "${BLUE}━ Step 2 / 3 · 设置接收消息的 open_id ━━━━━━━━${NC}"
-    echo "如何获取你的 open_id："
-    echo -e "  ${CYAN}lark-cli contact +batchGetId --emails your-email@example.com${NC}"
+    echo "如何获取你的 open_id（先登录，再取自己的信息）："
+    echo -e "  ${CYAN}lark-cli auth login${NC}"
+    echo -e "  ${CYAN}lark-cli contact +get-user | python3 -c \"import sys,json;print(json.load(sys.stdin)['data']['user']['open_id'])\"${NC}"
     echo ""
 
     if [ -n "$flag" ]; then

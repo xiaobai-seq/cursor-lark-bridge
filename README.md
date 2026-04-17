@@ -57,9 +57,14 @@ fb init
 This walks you through three steps:
 
 1. **`lark-cli` check** – confirms you can talk to Feishu.
-2. **`open_id`** – paste in your own Feishu `open_id`. Get it with:
+2. **`open_id`** – paste in your own Feishu `open_id`. Get it by logging in and
+   fetching your own profile:
    ```bash
-   lark-cli contact +batchGetId --emails you@example.com
+   lark-cli auth login                      # first time only — OAuth device flow
+   lark-cli contact +get-user               # prints JSON; look for data.user.open_id
+   # one-liner:
+   lark-cli contact +get-user \
+     | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['user']['open_id'])"
    ```
 3. **`hooks.json` merge** – shows you a diff, backs up the original, and writes `~/.cursor/hooks.json` with the new entries. Your existing hooks are preserved.
 

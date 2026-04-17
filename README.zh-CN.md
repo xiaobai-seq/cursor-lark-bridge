@@ -57,11 +57,15 @@ fb init
 会带你过三步：
 
 1. **lark-cli 检查** – 确认你已能跟飞书通信。
-2. **open_id 输入** – 粘贴你自己的飞书 `open_id`，可通过：
+2. **open_id 输入** – 粘贴你自己的飞书 `open_id`。获取方式：先 OAuth 登录，
+   再查询自己的信息：
    ```bash
-   lark-cli contact +batchGetId --emails you@example.com
+   lark-cli auth login                      # 第一次使用才需要，走设备码 OAuth
+   lark-cli contact +get-user               # 输出 JSON，data.user.open_id 即是
+   # 一行拿 open_id：
+   lark-cli contact +get-user \
+     | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['user']['open_id'])"
    ```
-   获取。
 3. **合并 hooks.json** – 展示 diff，备份原文件，把新的 hook 条目写进 `~/.cursor/hooks.json`。你已有的 hook 会原样保留。
 
 ## 日常使用
