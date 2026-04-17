@@ -17,6 +17,8 @@ Cursor hooks are powerful but local. If you walk away from your laptop, the Agen
 - **Five Cursor hooks covered** – `beforeShellExecution`, `beforeMCPExecution`, `preToolUse` (`AskQuestion` / `SwitchMode`), `afterAgentResponse`, `stop`.
 - **Card + text fallback** – click `✅ Approve` / `❌ Deny` or just type a reply.
 - **Multi-agent safe** – each card shows a per-conversation label (`project · #abcd123`); override with `FEISHU_BRIDGE_AGENT_LABEL=...`.
+- **Self-healing daemon** – PID lock prevents double daemons, child `lark-cli` lives in its own process group and dies with the daemon, stderr-driven auto-recovery from `already running` conflicts, real three-tier health probe (`subscribe_ok` / `last_event_age_ms` / `restart_count`).
+- **Built-in diagnostics** – `fb doctor [--fix]` checks five classes of real-world breakage (legacy processes, lark-cli orphans, PID drift, port 19836, duplicate hook entries) and can auto-repair all of them.
 - **Idempotent installer** – `install.sh` is safe to re-run, and `fb init` merges into your existing `~/.cursor/hooks.json` with a diff preview and backup.
 - **Zero third-party Go deps** – stdlib only; binary < 6 MB.
 - **Offline-friendly** – no data leaves your machine except the Feishu messages the daemon itself sends.
@@ -75,14 +77,18 @@ This walks you through three steps:
 ## Daily use
 
 ```bash
-fb start      # activate remote mode (sends an activation card to Feishu)
-fb status     # show daemon / event-subscribe / remote-mode state + version
-fb stop       # deactivate remote mode, daemon keeps running
-fb kill       # stop the daemon process entirely
-fb restart    # restart daemon and re-activate
+fb start              # activate remote mode (sends an activation card to Feishu)
+fb status             # show daemon / event-subscribe / remote-mode state + version
+fb stop               # deactivate remote mode, daemon keeps running
+fb kill               # stop the daemon process entirely
+fb restart            # restart daemon and re-activate
+fb doctor             # diagnose common failure modes (stale procs, port, hooks, ...)
+fb doctor --fix       # one-shot auto-fix for everything the diagnostic turns up
 ```
 
 While remote mode is **active**, every Cursor hook is routed through Feishu. When it's **inactive**, hooks no-op and Cursor behaves normally.
+
+`fb status` reports a three-tier health for the event subscription: **healthy** (stable for >2 s and receiving events/heartbeats), **unstable** (currently restarting — usually a conflicting subscriber holding the slot), **not running** (the `lark-cli` child process is gone). Anything other than "healthy" → run `fb doctor`.
 
 ## Running multiple Cursor agents in parallel
 
@@ -136,16 +142,49 @@ At runtime the installer lays things out under:
 
 ## Troubleshooting
 
-| Symptom | What to try |
-|---|---|
-| `未找到 config.json` on `fb start` | run `fb init` first |
-| Feishu receives no cards | `fb status` — is `event subscribe` running? If not, check `lark-cli auth login` (daemon runs it as bot). |
-| `HTTP 400: open_id cross app` in `daemon.log` | The `open_id` in `config.json` was issued by a different app than the one `lark-cli` is currently bound to. Re-run `fb init --force` to auto-detect the correct value. |
-| Cards arrive, buttons don't resolve | inspect `~/.cursor/cursor-lark-bridge/daemon.log` — usually a lark-cli scope / permission issue |
-| `fb` not found in shell | add `~/.local/bin` to `PATH` |
-| `command not found: lark-cli` | install it first: https://github.com/larksuite/lark-cli |
+**When something feels off, run `fb doctor` first.** Every symptom in the table below can be pinpointed — and, for most of them, auto-fixed with `fb doctor --fix`.
+
+| Symptom | Root cause | What to do |
+|---|---|---|
+| `未找到 config.json` on `fb start` | never initialized | `fb init` |
+| Feishu receives no cards at all | event subscribe is not running | `fb status` — if `event subscribe` is `not running` / `unstable`, run `fb doctor --fix`; if `lark-cli` itself is not authenticated, run `lark-cli auth login` |
+| **Messages stop arriving after the screen has been off for a while** | a previous crash left a `lark-cli event +subscribe` orphan holding the "one-subscriber-per-app" slot, so every subsequent reconnect is rejected | `fb doctor --fix` — kills the orphan and the daemon reconnects automatically |
+| **Every interaction delivers two authorization cards and the second card's buttons do nothing** | `~/.cursor/hooks.json` contains both the old `hooks/feishu-bridge/*` entries and the new `hooks/cursor-lark-bridge/*` entries; Cursor only awaits the **first** hook's response, so the second card's button events are discarded | `fb doctor --fix` — backs up `hooks.json`, removes the stale entries, and deletes the old `hooks/feishu-bridge/` directory |
+| `HTTP 400: open_id cross app` in `daemon.log` | the `open_id` in `config.json` was issued by a different app than the one `lark-cli` is currently bound to | `fb init --force` to re-detect under the current app |
+| Cards arrive (**just one**) but the button does nothing | usually a lark-cli scope / permission issue | read `~/.cursor/cursor-lark-bridge/daemon.log`; make sure the bot/app has `im:message:send_as_bot` and related scopes |
+| `fb status` shows `event subscribe: unstable (restarting, total N restarts)` | someone else is contending for the same subscription slot (stale orphan, legacy daemon, …) | `fb doctor --fix` |
+| `fb` not found in shell | `~/.local/bin` not on `PATH` | add `~/.local/bin` to `PATH` |
+| `command not found: lark-cli` | lark-cli is not installed | [install lark-cli](https://github.com/larksuite/lark-cli) |
 
 Full log: `~/.cursor/cursor-lark-bridge/daemon.log`.
+
+### What `fb doctor` actually checks
+
+```text
+[1/5] legacy feishu-bridge processes   → they would steal port 19836
+[2/5] lark-cli event subscribers       → expect exactly 2 (node shim + real binary); more = orphans
+[3/5] PID file consistency             → prevents `fb` from misreading daemon state
+[4/5] whoever is listening on 19836    → a non-bridge occupant makes the new daemon's bind fail
+[5/5] stale feishu-bridge entries in hooks.json  → root cause of the "two cards, second inert" bug
+```
+
+Process scans filter out shell interpreters via `ps -o comm=`, so even if the doctor script's own `cmdline` contains the literal string `feishu-bridge-daemon`, it will never match itself.
+
+### Upgrading from the old `feishu-bridge` project
+
+This project was called `feishu-bridge` before v0.1.0 and was renamed to `cursor-lark-bridge`. If you are coming from the old name, **run this once right after the upgrade**:
+
+```bash
+fb doctor --fix
+```
+
+It will:
+
+1. Kill any surviving old `feishu-bridge-daemon` process.
+2. Back up and strip the `hooks/feishu-bridge/*` entries from `~/.cursor/hooks.json`.
+3. Remove the old `~/.cursor/hooks/feishu-bridge/` scripts directory.
+
+The old **root** directory `~/.cursor/feishu-bridge/` (binary, logs, config from the old project) is intentionally **not** removed automatically — look through it first, then `rm -rf` it by hand if you don't need anything inside.
 
 ## Security notes
 
