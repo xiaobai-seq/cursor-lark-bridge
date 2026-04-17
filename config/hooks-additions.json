@@ -1,0 +1,34 @@
+{
+  "beforeShellExecution": [
+    {
+      "command": "bash ./hooks/cursor-lark-bridge/shell-approve.sh",
+      "timeout": 600
+    }
+  ],
+  "beforeMCPExecution": [
+    {
+      "command": "bash ./hooks/cursor-lark-bridge/mcp-approve.sh",
+      "timeout": 600
+    }
+  ],
+  "preToolUse": [
+    {
+      "command": "bash ./hooks/cursor-lark-bridge/pretool-approve.sh",
+      "matcher": "AskQuestion|SwitchMode",
+      "timeout": 600
+    }
+  ],
+  "afterAgentResponse": [
+    {
+      "command": "bash ./hooks/cursor-lark-bridge/agent-response.sh",
+      "timeout": 5
+    }
+  ],
+  "stop": [
+    {
+      "command": "bash ./hooks/cursor-lark-bridge/on-stop.sh",
+      "timeout": 600,
+      "loop_limit": 20
+    }
+  ]
+}

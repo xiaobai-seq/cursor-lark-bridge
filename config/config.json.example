@@ -1,0 +1,4 @@
+{
+  "_comment": "Fill in your Feishu open_id below. Get it by running: lark-cli contact +batchGetId --emails you@example.com",
+  "open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+}

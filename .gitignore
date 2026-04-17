@@ -1,0 +1,29 @@
+# 运行时文件（用户本地）
+*.pid
+*.log
+state.json
+last-response.txt
+config.json
+
+# 编译产物
+daemon/cursor-lark-bridge-daemon
+daemon/*.test
+dist/
+tmp/
+
+# 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# 本地测试
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+
+# GoReleaser
+/dist/

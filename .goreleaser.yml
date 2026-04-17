@@ -1,0 +1,78 @@
+# GoReleaser config for cursor-lark-bridge
+# Docs: https://goreleaser.com
+#
+# Each archive bundles the daemon binary together with scripts/, hooks/
+# and config/ so that install.sh can lay everything out in one tar extraction.
+
+version: 2
+
+project_name: cursor-lark-bridge
+
+before:
+  hooks:
+    - go -C daemon mod tidy
+
+builds:
+  - id: cursor-lark-bridge-daemon
+    dir: daemon
+    binary: cursor-lark-bridge-daemon
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+      - README.zh-CN.md
+      - install.sh
+      - scripts/bridge.sh
+      - scripts/hooks-merge.py
+      - hooks/*.sh
+      - hooks/*.py
+      - config/hooks-additions.json
+      - config/config.json.example
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-dev"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: xiaobai-seq
+    name: cursor-lark-bridge
+  draft: false
+  prerelease: auto
+  header: |
+    ## cursor-lark-bridge {{ .Tag }}
+
+    Install with:
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/xiaobai-seq/cursor-lark-bridge/main/install.sh | bash
+    ```

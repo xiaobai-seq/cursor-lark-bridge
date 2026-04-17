@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: daemon/go.sum
+
+      - name: go build
+        run: go -C daemon build -ldflags="-X main.version=ci" -o /tmp/clb-daemon .
+
+      - name: go vet
+        run: go -C daemon vet ./...
+
+      - name: shell syntax check
+        run: |
+          bash -n install.sh
+          bash -n scripts/bridge.sh
+          for f in hooks/*.sh; do bash -n "$f"; done
+
+      - name: hooks-merge smoke test
+        run: bash tests/hooks-merge-test.sh
