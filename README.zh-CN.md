@@ -168,21 +168,55 @@ cursor-lark-bridge/
 
 进程层面的扫描使用 `ps -o comm=` 过滤掉 `bash / sh / zsh` 等解释器，所以即便这个脚本自己的 `cmdline` 字面含 `feishu-bridge-daemon` 字符串，也不会误伤自己。
 
-### 从老版 `feishu-bridge` 项目升级
+### 升级到新版本
 
-本项目早期叫 `feishu-bridge`，在 v0.1.0 重命名成 `cursor-lark-bridge`。如果你是从老版升上来的，**装完新版后务必跑一次**：
+`install.sh` 是幂等的：可以重复跑，daemon 二进制 / bridge.sh / hook 脚本会被覆盖，`config.json` 被保留。但**老 daemon 进程不会被自动停**，所以重装后必须自己 `fb restart`（或 `fb kill && fb start`）才能真正用上新二进制。根据你的起点选对应路径：
+
+#### 情况 A：从旧版 `cursor-lark-bridge` 升级（v0.1.x → 最新）
+
+包名、配置结构、hooks 路径都没变，只换二进制：
 
 ```bash
-fb doctor --fix
+fb status                                                                           # 确认当前版本
+fb kill                                                                             # 停老 daemon
+curl -fsSL https://raw.githubusercontent.com/xiaobai-seq/cursor-lark-bridge/main/install.sh | bash
+fb start                                                                            # 启新 daemon
+fb doctor                                                                           # 自检（无需 --fix）
 ```
 
-它会：
+**不用**再跑 `fb init` —— `open_id` 和 `~/.cursor/hooks.json` 都复用。
+
+#### 情况 B：从重命名前的 `feishu-bridge` 项目升级
+
+本项目早期叫 `feishu-bridge`，v0.1.0 重命名为 `cursor-lark-bridge`。如果你是从这个老项目升上来的，**需要额外一步 `fb doctor --fix` 清老残留**：
+
+```bash
+pkill -9 -f feishu-bridge-daemon || true                                            # 停老 daemon（老项目没 fb kill）
+curl -fsSL https://raw.githubusercontent.com/xiaobai-seq/cursor-lark-bridge/main/install.sh | bash
+fb init                                                                             # 首次配置（新 open_id + 新 hooks 路径）
+fb doctor --fix                                                                     # 一键清：老进程 / hooks.json 重复条目 / 老脚本目录
+fb start
+```
+
+`fb doctor --fix` 会做：
 
 1. 杀掉还活着的老 `feishu-bridge-daemon` 进程；
 2. 备份并清理 `~/.cursor/hooks.json` 里指向 `hooks/feishu-bridge/*` 的老条目；
 3. 删除 `~/.cursor/hooks/feishu-bridge/` 老脚本目录。
 
-`~/.cursor/feishu-bridge/` 这个老**根目录**（老版的二进制、日志、config）`doctor` 不会自动删，留给你确认里面没有值得保留的东西后手动 `rm -rf` 掉。
+`~/.cursor/feishu-bridge/` 这个老**根目录**（老版的二进制、日志、config）`doctor` **不会**自动删，留给你确认里面没有值得保留的东西后手动 `rm -rf` 掉。
+
+#### 情况 C：不确定当前状态 —— 一把梭
+
+下面这串命令对"旧 cursor-lark-bridge"、"旧 feishu-bridge"、"从未装过"这三种起点都安全：
+
+```bash
+fb kill 2>/dev/null || pkill -9 -f feishu-bridge-daemon 2>/dev/null || true
+curl -fsSL https://raw.githubusercontent.com/xiaobai-seq/cursor-lark-bridge/main/install.sh | bash
+fb init          # 已有 config.json 会被保留；没有才真正走首次配置
+fb doctor --fix  # 任何残留一键清
+fb start
+```
 
 ## 安全说明
 

@@ -170,21 +170,55 @@ Full log: `~/.cursor/cursor-lark-bridge/daemon.log`.
 
 Process scans filter out shell interpreters via `ps -o comm=`, so even if the doctor script's own `cmdline` contains the literal string `feishu-bridge-daemon`, it will never match itself.
 
-### Upgrading from the old `feishu-bridge` project
+### Upgrading to a newer version
 
-This project was called `feishu-bridge` before v0.1.0 and was renamed to `cursor-lark-bridge`. If you are coming from the old name, **run this once right after the upgrade**:
+`install.sh` is idempotent: re-run it and the daemon binary / `bridge.sh` / hook scripts are overwritten while `config.json` is preserved. The installer does **not** stop the running daemon, so you have to `fb restart` (or `fb kill && fb start`) after the upgrade to actually run the new binary. Pick your path below based on where you are starting from:
+
+#### Case A: upgrading an existing `cursor-lark-bridge` (v0.1.x → latest)
+
+Same package name, same config layout, same hook paths — just replace the binary:
 
 ```bash
-fb doctor --fix
+fb status                                                                           # inspect current version
+fb kill                                                                             # stop the old daemon
+curl -fsSL https://raw.githubusercontent.com/xiaobai-seq/cursor-lark-bridge/main/install.sh | bash
+fb start                                                                            # bring the new daemon up
+fb doctor                                                                           # self-check (no --fix needed)
 ```
 
-It will:
+No need to re-run `fb init` — your `open_id` and `~/.cursor/hooks.json` are reused.
+
+#### Case B: upgrading from the old `feishu-bridge` project
+
+This project was called `feishu-bridge` before v0.1.0 and was renamed to `cursor-lark-bridge`. Coming from the old name needs one extra `fb doctor --fix` to sweep residues:
+
+```bash
+pkill -9 -f feishu-bridge-daemon || true                                            # old project had no fb kill
+curl -fsSL https://raw.githubusercontent.com/xiaobai-seq/cursor-lark-bridge/main/install.sh | bash
+fb init                                                                             # first-time configure (new open_id + new hook paths)
+fb doctor --fix                                                                     # sweep: old procs / duplicate hooks / stale dirs
+fb start
+```
+
+`fb doctor --fix` will:
 
 1. Kill any surviving old `feishu-bridge-daemon` process.
 2. Back up and strip the `hooks/feishu-bridge/*` entries from `~/.cursor/hooks.json`.
 3. Remove the old `~/.cursor/hooks/feishu-bridge/` scripts directory.
 
 The old **root** directory `~/.cursor/feishu-bridge/` (binary, logs, config from the old project) is intentionally **not** removed automatically — look through it first, then `rm -rf` it by hand if you don't need anything inside.
+
+#### Case C: not sure what you have — the catch-all
+
+The sequence below is safe for "old `cursor-lark-bridge`", "old `feishu-bridge`", and "never installed":
+
+```bash
+fb kill 2>/dev/null || pkill -9 -f feishu-bridge-daemon 2>/dev/null || true
+curl -fsSL https://raw.githubusercontent.com/xiaobai-seq/cursor-lark-bridge/main/install.sh | bash
+fb init          # existing config.json is preserved; only prompts if it's truly a first install
+fb doctor --fix  # clear whatever residue is found
+fb start
+```
 
 ## Security notes
 
