@@ -28,8 +28,10 @@ DAEMON_DIR="$BRIDGE_DIR/daemon"
 HOOKS_DIR="$HOME/.cursor/hooks/cursor-lark-bridge"
 FB_BIN="$INSTALL_PREFIX/bin/fb"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+# NOTE: use ANSI-C quoting ($'...') so \033 becomes the real ESC byte.
+# Otherwise heredoc-based banners would print the literal string \033[...
+RED=$'\033[0;31m';  GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
+BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m';   NC=$'\033[0m'
 
 log()  { printf '%b\n' "$*"; }
 step() { printf "\n${BLUE}▶ %s${NC}\n" "$*"; }

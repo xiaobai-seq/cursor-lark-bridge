@@ -19,12 +19,14 @@ PID_FILE="$BRIDGE_DIR/daemon.pid"
 DAEMON_ADDR="http://127.0.0.1:19836"
 LOG_FILE="$BRIDGE_DIR/daemon.log"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# NOTE: ANSI-C quoting so \033 expands to a real ESC byte, which works
+# consistently with echo, printf %s and heredoc-based output alike.
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+NC=$'\033[0m'
 
 is_daemon_running() {
     if [ -f "$PID_FILE" ]; then
