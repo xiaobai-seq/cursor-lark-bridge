@@ -275,6 +275,17 @@ func (d *Daemon) isActive() bool {
 	return d.state.Active
 }
 
+// uptime 从持久化的 daemon.pid 里读 start_ts，推算当前 daemon 已经运行的时长。
+// 读不到或无 start_ts 时返回 0，formatDuration(0) 会渲染成 "?"，
+// 让 /ping 之类不依赖 uptime 字段的命令也能优雅降级。
+func (d *Daemon) uptime() time.Duration {
+	info, err := readPIDFile(d.baseDir)
+	if err != nil || info == nil || info.StartTS == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(info.StartTS, 0))
+}
+
 // ── 事件订阅：同时监听消息 + 卡片按钮点击 ──
 //
 // 设计要点（v0.1.5 起）：
@@ -512,7 +523,13 @@ func (d *Daemon) handleMessageEvent(line string) {
 	if text == "" {
 		return
 	}
-	logInfo("收到文字回复: %s", truncate(text, 100))
+	logInfo("收到文字消息: %s", truncate(text, 100))
+
+	// 斜杠命令分流：routeSlash 返回 true 表示已被 slash 命令处理（不走 pending 分发）
+	if d.routeSlash(text) {
+		return
+	}
+
 	d.dispatchTextReply(text)
 }
 
@@ -693,6 +710,20 @@ func (d *Daemon) sendCard(cardJSON string) error {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("lark-cli 发消息失败: %v, output=%s", err, truncate(string(out), 300))
+	}
+	return nil
+}
+
+// sendText 通过 lark-cli 发一条纯文字消息给当前配置的 open_id，供斜杠命令回复使用。
+func (d *Daemon) sendText(content string) error {
+	cmd := exec.Command("lark-cli", "im", "+messages-send",
+		"--user-id", d.config.OpenID,
+		"--msg-type", "text",
+		"--content", content,
+		"--as", "bot")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("lark-cli 发文字消息失败: %v, output=%s", err, truncate(string(out), 300))
 	}
 	return nil
 }
