@@ -108,6 +108,33 @@ fb service uninstall   # 卸载，数据目录保留
 
 首次开机或系统重启后，daemon 无需任何操作即可恢复服务。
 
+## 飞书斜杠命令（远程查状态 + 批量取消）
+
+v0.2 起你可以在飞书单聊里发**斜杠命令**给桥接器的 bot，快速查询或操作 daemon 状态。支持 ASCII `/` 和全角 `／`，命令不区分大小写。
+
+| 命令 | 中文别名 | 功能 |
+|---|---|---|
+| `/ping` | — | 探活：返回 version · uptime · reconnect · 订阅状态 |
+| `/status` | `/状态` | 蓝色卡片：daemon 健康度 + 所有待处理 pending（含 workspace + 等待时长） |
+| `/stop` | `/停止` | 灰色卡片：批量取消所有 pending — Shell/MCP/Ask 收 deny，Agent 停止收 skip |
+| `/help` | `/帮助` `/指令` | 列出所有可用命令 + 一句话说明 |
+
+### 使用场景
+
+- 离开电脑时飞书看到一张"Shell 授权"卡没注意响应了 `⏰ 超时`，想看看当前还有几条没处理 → `/status`
+- 3 条长命令排队都不想再跑了 → `/stop`（同时取消待审批 + 待 AskQuestion 回复 + 待 stop hook）
+- 忘了命令名 → `/帮助`
+
+### 安全边界
+
+- 斜杠命令**不走 pending FIFO**：即使并行发了 `/status`，当前正在等的审批也不会被错乱
+- 群聊里不响应（daemon 只认配置里的单聊 `open_id`）
+- `/stop` 的 `deny` 只会让 hook 返回"拒绝"，**不**杀任何进程 —— 想彻底停 daemon 请 `fb service stop`（launchd 10 秒内会再拉起）或 `fb service uninstall`
+
+### 卡片样式预览
+
+项目 `tests/slash-samples/` 目录下的 JSON 文件就是 4 张卡片的离线样例（`/status` 空 / `/status` 3 条 pending / `/stop` 取消 3 条 / `/help`）。用飞书开发者后台的[卡片搭建工具](https://open.feishu.cn/cardkit) 粘贴内容即可可视化。
+
 ## 并行多个 Cursor Agent
 
 每个 hook 自动在卡片上打上短标识，类似 `my-project · #dfc1e56a`（由 workspace 路径 + 会话 ID 派生）。想要个更直观的名字：
