@@ -13,7 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +29,9 @@ const (
 	stateFileName  = "state.json"
 	pidFileName    = "daemon.pid"
 	approveTimeout = 10 * time.Minute
+	// supervisor 指数退避：2s → 4s → ... → 5min 封顶
+	supervisorInitialBackoff = 2 * time.Second
+	supervisorMaxBackoff     = 5 * time.Minute
 )
 
 // ── 配置 & 状态 ──
@@ -43,11 +46,41 @@ type State struct {
 
 // ── Daemon ──
 
-// pendingEntry 把等待回复的 channel 和发起请求的 Agent 标识绑在一起，
-// 方便按钮回执卡片上也能正确显示 Agent 身份
+// pendingEntry 把等待回复的 channel、发起请求的 Agent 标识以及
+// /status 斜杠命令需要的 metadata（kind/summary/workspace 等）绑在一起
+//
+// 字段分两层：
+//   - reply：内部通信 channel，不对外暴露（只走 dispatch*Reply 通路）
+//   - 其余字段：面向 /status 的 PendingView 快照，创建时就定格，
+//     不会在生命周期内被修改，所以 snapshotPending 只需拷贝结构体值
 type pendingEntry struct {
-	reply chan string
-	agent string
+	reply     chan string
+	id        string
+	kind      string // shell / mcp / ask / stop / 其它，供 /status 分类展示
+	summary   string // 简短描述（命令/工具名/问题，单行，脱敏）
+	workspace string // 项目 basename，可空
+	agent     string
+	createdTS int64 // Unix 秒，创建时间
+}
+
+// PendingView 是 pendingEntry 的只读快照，供 /status 斜杠命令或其它
+// 外部观察者安全读取，不暴露 reply channel，复制时也不持锁
+type PendingView struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind"`
+	Summary   string `json:"summary"`
+	Workspace string `json:"workspace,omitempty"`
+	Agent     string `json:"agent,omitempty"`
+	CreatedTS int64  `json:"created_ts"`
+}
+
+// pendingMeta 是 HTTP handler 注册 pending 时把 kind/summary/workspace/agent
+// 四元组一起传给 waitReply 的内部 helper，避免 waitReply 参数膨胀
+type pendingMeta struct {
+	kind      string
+	summary   string
+	workspace string
+	agent     string
 }
 
 type Daemon struct {
@@ -56,7 +89,7 @@ type Daemon struct {
 	state     *State
 	stateMu   sync.RWMutex
 	pending   map[string]*pendingEntry
-	pendingMu sync.Mutex
+	pendingMu sync.RWMutex // 写锁用于注册/删除；读锁用于 snapshotPending 等只读快照
 	reqSeq    atomic.Int64
 
 	// 事件订阅子进程（lark-cli event +subscribe）相关状态
@@ -103,6 +136,12 @@ type ApproveRequest struct {
 	Content string `json:"content"`
 	Context string `json:"context"`
 	Agent   string `json:"agent"` // Agent 标识（项目名 · #id），用于多会话并行时区分
+
+	// 以下字段是 P2 新增的 metadata，供 /status 斜杠命令展示使用
+	// 老 hook（未升级到 P2.2）不会发送这些字段，daemon 会从 Title/Content 兜底
+	Kind      string `json:"kind,omitempty"`      // shell / mcp（空时 fallback 为 Type）
+	Summary   string `json:"summary,omitempty"`   // 简短描述（空时从 Content/Title 兜底）
+	Workspace string `json:"workspace,omitempty"` // 项目 basename
 }
 
 type ApproveResponse struct {
@@ -115,6 +154,11 @@ type AskRequest struct {
 	Options  []string `json:"options"`
 	Context  string   `json:"context"`
 	Agent    string   `json:"agent"` // Agent 标识
+
+	// P2 新增 metadata（同 ApproveRequest 的语义）
+	Kind      string `json:"kind,omitempty"`      // 空时默认 "ask"
+	Summary   string `json:"summary,omitempty"`   // 空时 fallback 为 Question
+	Workspace string `json:"workspace,omitempty"` // 项目 basename
 }
 
 type AskResponse struct {
@@ -132,9 +176,13 @@ type NotifyRequest struct {
 // Agent 停止 hook 的请求体：展示 Agent 最后输出，等待用户决定是否继续
 type StopRequest struct {
 	Status    string `json:"status"`     // completed / aborted / error
-	Summary   string `json:"summary"`    // Agent 最后输出摘要
+	Summary   string `json:"summary"`    // Agent 最后输出摘要（P2 之前就有，这里不重复声明）
 	LoopCount int    `json:"loop_count"` // stop hook 的循环计数
 	Agent     string `json:"agent"`      // Agent 标识
+
+	// P2 新增 metadata；Summary 已存在故不重复声明
+	Kind      string `json:"kind,omitempty"`      // 空时默认 "stop"
+	Workspace string `json:"workspace,omitempty"` // 项目 basename
 }
 
 // Agent 停止 hook 的响应体
@@ -215,42 +263,8 @@ func (d *Daemon) saveState() {
 	os.WriteFile(filepath.Join(d.baseDir, stateFileName), data, 0644)
 }
 
-// acquirePIDLock 检查是否已有活 daemon，没有则写入自己的 PID
-// 返回非 nil error 时 daemon 必须退出，防止并发启动互相踩（例如同时启动会清理对方的 lark-cli 子进程）
-func (d *Daemon) acquirePIDLock() error {
-	p := filepath.Join(d.baseDir, pidFileName)
-	if data, err := os.ReadFile(p); err == nil {
-		pidStr := strings.TrimSpace(string(data))
-		if pidStr != "" {
-			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 && pid != os.Getpid() {
-				if proc, err := os.FindProcess(pid); err == nil {
-					// Signal(0) 不实际发信号，仅探测进程是否存活
-					if proc.Signal(syscall.Signal(0)) == nil {
-						return fmt.Errorf("另一个 daemon 已在运行 (PID=%d)，请先 `fb kill` 再启动", pid)
-					}
-				}
-			}
-		}
-	}
-	// 写入当前 PID；目录不存在时先创建，避免 PID 文件写入失败
-	if err := os.MkdirAll(d.baseDir, 0755); err != nil {
-		return fmt.Errorf("创建 %s 失败: %w", d.baseDir, err)
-	}
-	return os.WriteFile(p, []byte(strconv.Itoa(os.Getpid())), 0644)
-}
-
-func (d *Daemon) removePID() {
-	// 仅在 PID 文件里记录的仍是自己时才删除，防止并发重启下覆盖掉后来者的 PID
-	p := filepath.Join(d.baseDir, pidFileName)
-	if data, err := os.ReadFile(p); err == nil {
-		if pidStr := strings.TrimSpace(string(data)); pidStr != "" {
-			if pid, err := strconv.Atoi(pidStr); err == nil && pid != os.Getpid() {
-				return
-			}
-		}
-	}
-	os.Remove(p)
-}
+// pid 文件相关逻辑（acquire/remove/update）已抽到 pidfile.go，
+// 并从单行 PID 升级为 JSON schema（向后兼容 legacy 单行 PID）
 
 func (d *Daemon) nextRequestID(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, d.reqSeq.Add(1))
@@ -260,6 +274,17 @@ func (d *Daemon) isActive() bool {
 	d.stateMu.RLock()
 	defer d.stateMu.RUnlock()
 	return d.state.Active
+}
+
+// uptime 从持久化的 daemon.pid 里读 start_ts，推算当前 daemon 已经运行的时长。
+// 读不到或无 start_ts 时返回 0，formatDuration(0) 会渲染成 "?"，
+// 让 /ping 之类不依赖 uptime 字段的命令也能优雅降级。
+func (d *Daemon) uptime() time.Duration {
+	info, err := readPIDFile(d.baseDir)
+	if err != nil || info == nil || info.StartTS == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(info.StartTS, 0))
 }
 
 // ── 事件订阅：同时监听消息 + 卡片按钮点击 ──
@@ -280,20 +305,32 @@ func (d *Daemon) startEventSubscription(ctx context.Context) {
 	cleanupStaleLarkCLIEvent("startup")
 
 	go func() {
+		// supervisor 的 backoff 状态仅在本 goroutine 内使用，无需加锁
+		backoff := newBackoff(supervisorInitialBackoff, supervisorMaxBackoff)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
-			d.runOneSubscription(ctx)
-			sleepCtx(ctx, 3*time.Second)
+			// 每次尝试启动子进程前把 reconnect_count 持久化到 pid 文件
+			// 注意：第一次启动也会递增到 1（而不是 0），这是刻意的 —— 代表"这次启动是第 N 次尝试"
+			if err := updatePIDFile(d.baseDir, func(info *PIDInfo) {
+				info.ReconnectCount++
+			}); err != nil {
+				logErr("更新 daemon.pid reconnect_count 失败: %v", err)
+			}
+			d.runOneSubscription(ctx, backoff)
+			wait := backoff.Next()
+			logInfo("下次重连在 %v 后...", wait)
+			sleepCtx(ctx, wait)
 		}
 	}()
 }
 
-// runOneSubscription 启动一次 lark-cli event +subscribe 子进程并阻塞到它退出
-func (d *Daemon) runOneSubscription(ctx context.Context) {
+// runOneSubscription 启动一次 lark-cli event +subscribe 子进程并阻塞到它退出。
+// backoff 由 supervisor 持有并传入，readEvents 收到首条事件时会在其上调 Reset。
+func (d *Daemon) runOneSubscription(ctx context.Context, backoff *backoffState) {
 	logInfo("启动 lark-cli event +subscribe ...")
 	cmd := exec.CommandContext(ctx, "lark-cli", "event", "+subscribe",
 		"--event-types", "im.message.receive_v1,card.action.trigger",
@@ -332,7 +369,7 @@ func (d *Daemon) runOneSubscription(ctx context.Context) {
 		}
 	})
 
-	d.readEvents(ctx, stdout)
+	d.readEvents(ctx, stdout, backoff)
 	cmd.Wait()
 	stableTimer.Stop()
 	d.subscribeOK.Store(false)
@@ -345,7 +382,7 @@ func (d *Daemon) runOneSubscription(ctx context.Context) {
 		cleanupStaleLarkCLIEvent("conflict")
 	}
 
-	logInfo("lark-cli event +subscribe 已退出，3 秒后重启...")
+	logInfo("lark-cli event +subscribe 已退出")
 }
 
 // cleanupStaleLarkCLIEvent 尽力清理可能遗留的 lark-cli event +subscribe 进程
@@ -424,9 +461,13 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (d *Daemon) readEvents(ctx context.Context, r io.Reader) {
+// readEvents 循环读取 lark-cli 子进程 stdout。
+// 每次调用（= 每个 lark-cli 子进程生命周期）内第一条非空事件会调 backoff.Reset()，
+// 视为"订阅重新稳定"的信号，让下一次重连回到 initial backoff。
+func (d *Daemon) readEvents(ctx context.Context, r io.Reader, backoff *backoffState) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	firstEvent := true
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -440,6 +481,13 @@ func (d *Daemon) readEvents(ctx context.Context, r io.Reader) {
 
 		// 任何事件进入都更新时间戳，用于 /health 的真实健康探针
 		d.lastEventAt.Store(time.Now().UnixMilli())
+		if firstEvent {
+			firstEvent = false
+			if backoff != nil {
+				backoff.Reset()
+			}
+			logInfo("收到首条事件，重置重连退避")
+		}
 
 		// 先解析 type 字段判断事件类型
 		var base struct {
@@ -476,7 +524,13 @@ func (d *Daemon) handleMessageEvent(line string) {
 	if text == "" {
 		return
 	}
-	logInfo("收到文字回复: %s", truncate(text, 100))
+	logInfo("收到文字消息: %s", truncate(text, 100))
+
+	// 斜杠命令分流：routeSlash 返回 true 表示已被 slash 命令处理（不走 pending 分发）
+	if d.routeSlash(text) {
+		return
+	}
+
 	d.dispatchTextReply(text)
 }
 
@@ -590,10 +644,18 @@ func (d *Daemon) dispatchTextReply(text string) {
 	logInfo("无等待中的请求，丢弃回复: %s", truncate(text, 50))
 }
 
-func (d *Daemon) waitReply(requestID, agent string, timeout time.Duration) (string, error) {
+// waitReply 注册一个 pending 条目，阻塞等待来自 lark 的按钮/文字回复
+// 或 timeout 超时。meta 里的 kind/summary/workspace/agent 会一起存进
+// pendingEntry，方便 /status 斜杠命令快照时展示。
+func (d *Daemon) waitReply(requestID string, meta pendingMeta, timeout time.Duration) (string, error) {
 	entry := &pendingEntry{
-		reply: make(chan string, 1),
-		agent: agent,
+		reply:     make(chan string, 1),
+		id:        requestID,
+		kind:      meta.kind,
+		summary:   meta.summary,
+		workspace: meta.workspace,
+		agent:     meta.agent,
+		createdTS: time.Now().Unix(),
 	}
 	d.pendingMu.Lock()
 	d.pending[requestID] = entry
@@ -613,6 +675,79 @@ func (d *Daemon) waitReply(requestID, agent string, timeout time.Duration) (stri
 	}
 }
 
+// snapshotPending 在读锁下拷贝一份 pending map 的只读 view 列表。
+// 用 RLock 而非 Lock 的目的是：/status 斜杠命令可能被频繁调用，
+// 读锁允许多个 snapshot 并发进行，不阻塞 waitReply 注册新 pending
+// 以外的读路径（dispatch*Reply 仍持写锁，所以写路径不受影响）。
+//
+// 由于 pendingEntry 的 metadata 字段（id/kind/summary/workspace/agent/createdTS）
+// 在 waitReply 创建后不会被修改，这里直接把值拷贝到 PendingView 即可，
+// 无需再加 entry 级别的锁。
+func (d *Daemon) snapshotPending() []PendingView {
+	d.pendingMu.RLock()
+	defer d.pendingMu.RUnlock()
+	views := make([]PendingView, 0, len(d.pending))
+	for _, e := range d.pending {
+		views = append(views, PendingView{
+			ID:        e.id,
+			Kind:      e.kind,
+			Summary:   e.summary,
+			Workspace: e.workspace,
+			Agent:     e.agent,
+			CreatedTS: e.createdTS,
+		})
+	}
+	return views
+}
+
+// stopAllPending 尝试取消所有 pending 操作，供 /stop 斜杠命令调用。
+//
+// 按 kind 分派 reply 内容：
+//   - kind == "stop"（on-stop.sh 的 waiter）→ 发 "skip"，让会话结束
+//   - 其它 kind（shell / mcp / ask / askQuestion / switchMode 等）→ 发 "deny"，
+//     让 hook 返回 {"decision":"deny"} 跳过底层动作
+//
+// 非阻塞 send：如果 reply chan 已被别的路径 send 过（race，例如用户刚好
+// 点了"允许"按钮进入 dispatchButtonReply 但 entry 还没 defer cleanup），
+// 本次会走 default 分支跳过，已有的 decision 继续在 pipeline 里流转。
+//
+// 不主动 delete pending 条目——waitReply 自己的 defer 负责清理，
+// 保持和 dispatchButtonReply / dispatchTextReply 一致的生命周期契约。
+//
+// 返回：被处理的 pending 快照切片（按 createdTS 升序）+ 实际 send 成功的条数。
+func (d *Daemon) stopAllPending() ([]PendingView, int) {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+
+	views := make([]PendingView, 0, len(d.pending))
+	sent := 0
+	for _, e := range d.pending {
+		reply := "deny"
+		if e.kind == "stop" {
+			reply = "skip"
+		}
+		select {
+		case e.reply <- reply:
+			sent++
+		default:
+			logInfo("/stop: pending %s (kind=%s) chan 已满，跳过", e.id, e.kind)
+		}
+		views = append(views, PendingView{
+			ID:        e.id,
+			Kind:      e.kind,
+			Summary:   e.summary,
+			Workspace: e.workspace,
+			Agent:     e.agent,
+			CreatedTS: e.createdTS,
+		})
+	}
+
+	sort.Slice(views, func(i, j int) bool {
+		return views[i].CreatedTS < views[j].CreatedTS
+	})
+	return views, sent
+}
+
 // ── lark-cli 发消息 ──
 
 func (d *Daemon) sendCard(cardJSON string) error {
@@ -624,6 +759,20 @@ func (d *Daemon) sendCard(cardJSON string) error {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("lark-cli 发消息失败: %v, output=%s", err, truncate(string(out), 300))
+	}
+	return nil
+}
+
+// sendText 通过 lark-cli 发一条纯文字消息给当前配置的 open_id，供斜杠命令回复使用。
+func (d *Daemon) sendText(content string) error {
+	cmd := exec.Command("lark-cli", "im", "+messages-send",
+		"--user-id", d.config.OpenID,
+		"--msg-type", "text",
+		"--content", content,
+		"--as", "bot")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("lark-cli 发文字消息失败: %v, output=%s", err, truncate(string(out), 300))
 	}
 	return nil
 }
@@ -707,7 +856,27 @@ func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reply, err := d.waitReply(requestID, req.Agent, approveTimeout)
+	// 构造 pending metadata：老 hook（未升级到 P2.2）不发 Kind/Summary，
+	// 这里按优先级 Kind→Type、Summary→Content→Title 兜底
+	kind := req.Kind
+	if kind == "" {
+		kind = req.Type
+	}
+	summary := req.Summary
+	if summary == "" {
+		summary = summarizeOneLine(req.Content, 80)
+	}
+	if summary == "" {
+		summary = req.Title
+	}
+	meta := pendingMeta{
+		kind:      kind,
+		summary:   summary,
+		workspace: req.Workspace,
+		agent:     req.Agent,
+	}
+
+	reply, err := d.waitReply(requestID, meta, approveTimeout)
 	if err != nil {
 		logErr("等待审批回复失败: %v", err)
 		writeJSON(w, ApproveResponse{Decision: "allow"})
@@ -737,7 +906,23 @@ func (d *Daemon) handleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reply, err := d.waitReply(requestID, req.Agent, approveTimeout)
+	// ask 的 kind 默认就是 "ask"；summary fallback 为 Question 截到 80 字
+	kind := req.Kind
+	if kind == "" {
+		kind = "ask"
+	}
+	summary := req.Summary
+	if summary == "" {
+		summary = summarizeOneLine(req.Question, 80)
+	}
+	meta := pendingMeta{
+		kind:      kind,
+		summary:   summary,
+		workspace: req.Workspace,
+		agent:     req.Agent,
+	}
+
+	reply, err := d.waitReply(requestID, meta, approveTimeout)
 	if err != nil {
 		logErr("等待提问回复失败: %v", err)
 		httpErr(w, "timeout", http.StatusGatewayTimeout)
@@ -786,7 +971,24 @@ func (d *Daemon) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reply, err := d.waitReply(requestID, req.Agent, approveTimeout)
+	// stop 的 kind 默认 "stop"；summary 已由 hook 传入（Agent 最后输出），
+	// 空时 fallback 用 Status 字段（completed/aborted/error）
+	kind := req.Kind
+	if kind == "" {
+		kind = "stop"
+	}
+	summary := summarizeOneLine(req.Summary, 80)
+	if summary == "" {
+		summary = req.Status
+	}
+	meta := pendingMeta{
+		kind:      kind,
+		summary:   summary,
+		workspace: req.Workspace,
+		agent:     req.Agent,
+	}
+
+	reply, err := d.waitReply(requestID, meta, approveTimeout)
 	if err != nil {
 		// 超时当作"结束会话"，不注入 followup
 		logInfo("stop hook 等待回复超时，按结束处理")
@@ -1101,6 +1303,14 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// summarizeOneLine 把多行 lark_md 内容压成一行（换行变空格），再截到 n 字，
+// 给 pending metadata 的 summary fallback 用
+func summarizeOneLine(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.TrimSpace(s)
+	return truncate(s, n)
+}
+
 func boolStr(b bool, t, f string) string {
 	if b {
 		return t
@@ -1126,13 +1336,24 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 // ── main ──
 
 func main() {
+	baseDir := filepath.Join(homeDir(), ".cursor", "cursor-lark-bridge")
+	dl, err := setupLogging(baseDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[FATAL] setup logging: %v\n", err)
+		os.Exit(1)
+	}
+	// 把 log 包输出接到 dailyLogger + stderr 双路：stderr 兜底 launchd/nohup 捕获，
+	// dailyLogger 产出 logs/daemon-YYYY-MM-DD.log
+	log.SetOutput(io.MultiWriter(os.Stderr, dl))
+	defer dl.Close()
+
 	logInfo("cursor-lark-bridge daemon 启动中... (version=%s)", version)
 	d := newDaemon()
-	if err := d.acquirePIDLock(); err != nil {
+	if err := acquirePIDLockV2(d.baseDir); err != nil {
 		logErr("%v", err)
 		os.Exit(1)
 	}
-	defer d.removePID()
+	defer removePIDV2(d.baseDir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

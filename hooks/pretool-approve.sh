@@ -21,7 +21,7 @@ if [ "$active" != "True" ]; then
 fi
 
 echo "$input" | python3 -c "
-import sys, json, os
+import sys, json, os, re
 
 DAEMON = 'http://127.0.0.1:19836'
 AGENT = os.environ.get('AGENT_LABEL', '')
@@ -34,6 +34,17 @@ if isinstance(tool_input, str):
         tool_input = json.loads(tool_input)
     except:
         tool_input = {}
+
+# workspace 提取：workspace_roots[0] 的 basename，先 rstrip 避免尾随斜杠返回空串
+roots = d.get('workspace_roots') or []
+root_path = (roots[0] if roots else '') or ''
+root_path = root_path.rstrip('/')
+workspace = os.path.basename(root_path)
+
+# 统一脱敏：question 内容可能含敏感 kv，safeguard 一下
+SENSITIVE = re.compile(r'((?:api[_-]?key|password|token|secret|key|bearer)[=:\s]+)[^\s]+', re.IGNORECASE)
+def sanitize(text):
+    return SENSITIVE.sub(r'\1***', text or '')
 
 def curl_post(endpoint, data):
     import urllib.request
@@ -59,10 +70,18 @@ if tool_name == 'AskQuestion':
             options_all.append(o.get('label', ''))
 
     question_text = ' | '.join(parts) if parts else '需要您做选择'
+
+    # summary：取第一个 question 前 80 字（脱敏后）
+    first_q = sanitize((parts[0] if parts else question_text).replace('\n', ' ').strip())
+    summary = first_q[:77] + '...' if len(first_q) > 80 else first_q
+
     resp = curl_post('/ask', {
         'question': question_text,
         'options': options_all,
         'context': 'AskQuestion 交互',
+        'kind': 'askQuestion',
+        'summary': summary,
+        'workspace': workspace,
         'agent': AGENT,
     })
     if resp and resp.get('reply'):
@@ -78,11 +97,18 @@ if tool_name == 'AskQuestion':
 elif tool_name == 'SwitchMode':
     target_mode = tool_input.get('target_mode_id', '')
     explanation = tool_input.get('explanation', '')
+
+    # summary：target_mode_id（一般不含敏感值；保险起见也脱敏）
+    summary = sanitize(target_mode)[:80]
+
     resp = curl_post('/approve', {
         'type': 'mode_switch',
+        'kind': 'switchMode',
         'title': '🔄 模式切换请求',
         'content': f'**目标模式** \`{target_mode}\`\n**说明** {explanation}',
         'context': '模式切换',
+        'summary': summary,
+        'workspace': workspace,
         'agent': AGENT,
     })
     if resp and resp.get('decision') == 'deny':

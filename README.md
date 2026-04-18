@@ -90,6 +90,67 @@ While remote mode is **active**, every Cursor hook is routed through Feishu. Whe
 
 `fb status` reports a three-tier health for the event subscription: **healthy** (stable for >2 s and receiving events/heartbeats), **unstable** (currently restarting — usually a conflicting subscriber holding the slot), **not running** (the `lark-cli` child process is gone). Anything other than "healthy" → run `fb doctor`.
 
+## Auto-start + crash recovery (launchd)
+
+Since v0.2 the daemon can register as a **User LaunchAgent** for auto-start at
+login and automatic crash recovery within ~10s.
+
+```bash
+fb service install     # install plist and launchctl load
+fb service status      # show launchd load state
+fb service logs        # tail launchd stdout (use `logs err` for stderr)
+fb service uninstall   # remove the plist (data dir preserved)
+```
+
+After install:
+
+- **Logs** land in `~/.cursor/cursor-lark-bridge/logs/daemon-YYYY-MM-DD.log`
+  (per-day rotation, 7-day retention).
+- launchd's own stdout/stderr go to `logs/launchd-{stdout,stderr}.log`.
+- `fb start` keeps working: it only flips the "remote mode" flag — the daemon
+  itself is now supervised by launchd.
+- `fb kill` stops the daemon, but launchd will bring it back within
+  `ThrottleInterval=10` seconds. To fully stop, run `fb service uninstall`.
+
+The daemon comes back on its own after reboots — no manual step needed.
+
+## Feishu slash commands (remote status + bulk cancel)
+
+Since v0.2 you can send **slash commands** to the bridge bot in your
+Feishu 1-on-1 chat to query daemon state or perform bulk actions. Both
+ASCII `/` and fullwidth `／` are accepted; commands are case-insensitive.
+
+| Command | CN alias | What it does |
+|---|---|---|
+| `/ping` | — | Health probe: version · uptime · reconnect · subscribe state |
+| `/status` | `/状态` | Blue card: daemon health + every pending request with workspace + waited duration |
+| `/stop` | `/停止` | Grey card: bulk-cancel all pending — Shell/MCP/Ask get "deny", Agent-stop gets "skip" |
+| `/help` | `/帮助` `/指令` | List every command + one-line description |
+
+### Typical scenarios
+
+- You see a "Shell auth" card in Feishu that timed out; you want to know
+  how many others are still in the queue → `/status`
+- Three long-running commands are queued and you no longer need any of
+  them → `/stop` cancels all at once
+- You forgot the command name → `/help`
+
+### Safety boundaries
+
+- Slash commands **bypass the pending FIFO** — sending `/status` while
+  awaiting an approval does not scramble the queue
+- Group chats are ignored (daemon only trusts the configured 1-on-1
+  `open_id`)
+- `/stop` sends a "deny" — it never kills a process. To fully stop the
+  daemon use `fb service stop` (launchd respawns within 10s) or
+  `fb service uninstall`
+
+### Card previews
+
+Sample JSON for every slash card is checked in under
+`tests/slash-samples/`. Paste any of them into the Feishu Open Platform
+[card builder](https://open.feishu.cn/cardkit) to visualize.
+
 ## Running multiple Cursor agents in parallel
 
 Each hook automatically tags the card with a short label derived from the workspace + conversation ID, e.g. `my-project · #dfc1e56a`. If you want a friendlier name:
