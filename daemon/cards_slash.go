@@ -154,3 +154,78 @@ func kindIcon(kind string) string {
 		return "📌"
 	}
 }
+
+// stopCommand 实现 /stop 与中文别名 /停止，批量取消所有 pending 操作。
+//
+// 语义：调用 daemon.stopAllPending 后，根据结果渲染一张灰色卡片
+// 汇报"已取消 N 条 pending"。底层 reply 分派逻辑在 stopAllPending 里。
+type stopCommand struct{}
+
+func (c *stopCommand) Name() string        { return "stop" }
+func (c *stopCommand) Aliases() []string   { return []string{"/停止"} }
+func (c *stopCommand) Match(n string) bool { return matchByNameOrAlias(c, n) }
+func (c *stopCommand) Execute(d *Daemon) SlashReply {
+	views, sent := d.stopAllPending()
+	return SlashReply{CardJSON: buildStopCancelCard(views, sent)}
+}
+
+// buildStopCancelCard 根据 /stop 结果构建灰色卡片。
+//
+// 卡片结构：
+//   - header: grey 模板 + "🛑 已取消待处理操作"（为空时改为 "ℹ️ 当前无待处理操作"）
+//   - div: 概述 + 每条 pending 的一行（复用 formatPendingLine 保证和 /status 视觉一致）
+//   - hr
+//   - note: 底部命令提示
+//
+// 参数：
+//   - views：stopAllPending 返回的快照（已按 createdTS 升序）
+//   - sent：实际成功 send 到 reply chan 的条数；当 sent < len(views) 时会
+//     额外展示一行提示说明 race 情况下部分条目被跳过
+func buildStopCancelCard(views []PendingView, sent int) string {
+	title := "🛑 已取消待处理操作"
+	if len(views) == 0 {
+		title = "ℹ️ 当前无待处理操作"
+	}
+
+	var body string
+	if len(views) == 0 {
+		body = "没有需要取消的 pending。"
+	} else {
+		lines := make([]string, 0, len(views)+2)
+		lines = append(lines, fmt.Sprintf("**共 %d 条 pending，已发送取消信号 %d 条：**", len(views), sent))
+		now := time.Now().Unix()
+		for _, v := range views {
+			lines = append(lines, formatPendingLine(v, now))
+		}
+		if sent < len(views) {
+			lines = append(lines, fmt.Sprintf("_未发送的 %d 条 race 时可能已自行完成_", len(views)-sent))
+		}
+		body = strings.Join(lines, "\n")
+	}
+
+	card := map[string]interface{}{
+		"config": map[string]interface{}{"wide_screen_mode": true},
+		"header": map[string]interface{}{
+			"title":    map[string]interface{}{"tag": "plain_text", "content": title},
+			"template": "grey",
+		},
+		"elements": []interface{}{
+			map[string]interface{}{"tag": "div", "text": map[string]interface{}{"tag": "lark_md", "content": body}},
+			map[string]interface{}{"tag": "hr"},
+			map[string]interface{}{
+				"tag": "note",
+				"elements": []interface{}{
+					map[string]interface{}{
+						"tag":     "plain_text",
+						"content": "💬 /status 查看剩余 · /help 查看命令",
+					},
+				},
+			},
+		},
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(card)
+	return strings.TrimRight(buf.String(), "\n")
+}

@@ -189,3 +189,204 @@ func TestBuildStatusCard_Truncation(t *testing.T) {
 		}
 	}
 }
+
+// ── /stop ──
+
+func TestStopCommandMetadata(t *testing.T) {
+	c := &stopCommand{}
+	if c.Name() != "stop" {
+		t.Errorf("Name() = %q", c.Name())
+	}
+	aliases := c.Aliases()
+	if len(aliases) != 1 || aliases[0] != "/停止" {
+		t.Errorf("Aliases() = %v", aliases)
+	}
+	if !c.Match("stop") {
+		t.Errorf("Match(stop) 应 true")
+	}
+	if !c.Match("停止") {
+		t.Errorf("Match(停止) 应 true")
+	}
+	if c.Match("status") {
+		t.Errorf("Match(status) 不应匹配到 stop")
+	}
+}
+
+// 空 pending 时 stopAllPending 应返回 ([], 0)，不触发任何 send
+func TestStopAllPendingEmpty(t *testing.T) {
+	d := newTestDaemon()
+	views, sent := d.stopAllPending()
+	if len(views) != 0 {
+		t.Errorf("空 pending 返回 views 应为空，实际 %d", len(views))
+	}
+	if sent != 0 {
+		t.Errorf("空 pending 返回 sent 应为 0，实际 %d", sent)
+	}
+}
+
+// 混合 kind 的 pending：shell/mcp 发 "deny"，stop 发 "skip"，全部成功
+func TestStopAllPendingMixedKinds(t *testing.T) {
+	d := newTestDaemon()
+	now := time.Now().Unix()
+	// 提前存 chan 引用，绕过 map 遍历顺序的不确定性
+	entries := map[string]*pendingEntry{
+		"s1": {reply: make(chan string, 1), id: "s1", kind: "shell", summary: "npm test", createdTS: now - 3},
+		"s2": {reply: make(chan string, 1), id: "s2", kind: "shell", summary: "ls", createdTS: now - 2},
+		"st": {reply: make(chan string, 1), id: "st", kind: "stop", summary: "idle", createdTS: now - 1},
+		"m1": {reply: make(chan string, 1), id: "m1", kind: "mcp", summary: "tool.x", createdTS: now},
+	}
+	for id, e := range entries {
+		d.pending[id] = e
+	}
+
+	views, sent := d.stopAllPending()
+	if len(views) != 4 {
+		t.Fatalf("views 长度应为 4，实际 %d", len(views))
+	}
+	if sent != 4 {
+		t.Errorf("sent 应为 4（全部成功），实际 %d", sent)
+	}
+
+	// 按 createdTS 升序：s1 < s2 < st < m1
+	wantOrder := []string{"s1", "s2", "st", "m1"}
+	for i, id := range wantOrder {
+		if views[i].ID != id {
+			t.Errorf("views[%d].ID = %q, 期望 %q", i, views[i].ID, id)
+		}
+	}
+
+	// 每条 chan 都应能读出对应 reply
+	wantReply := map[string]string{
+		"s1": "deny",
+		"s2": "deny",
+		"m1": "deny",
+		"st": "skip",
+	}
+	for id, want := range wantReply {
+		select {
+		case got := <-entries[id].reply:
+			if got != want {
+				t.Errorf("entries[%s].reply = %q, 期望 %q", id, got, want)
+			}
+		default:
+			t.Errorf("entries[%s].reply 应有值 %q，实际 chan 为空", id, want)
+		}
+	}
+}
+
+// race 场景：某条 reply chan 已被别的路径 send 过（容量 1 已满），
+// stopAllPending 应走 default 分支跳过该条，其它条目仍正常 send
+func TestStopAllPendingSkipsAlreadyFilled(t *testing.T) {
+	d := newTestDaemon()
+	now := time.Now().Unix()
+	// 4 条条目，其中 s2 的 chan 预先 push "allow" 模拟 race
+	entries := map[string]*pendingEntry{
+		"s1": {reply: make(chan string, 1), id: "s1", kind: "shell", createdTS: now - 3},
+		"s2": {reply: make(chan string, 1), id: "s2", kind: "shell", createdTS: now - 2},
+		"st": {reply: make(chan string, 1), id: "st", kind: "stop", createdTS: now - 1},
+		"m1": {reply: make(chan string, 1), id: "m1", kind: "mcp", createdTS: now},
+	}
+	for id, e := range entries {
+		d.pending[id] = e
+	}
+	entries["s2"].reply <- "allow"
+
+	views, sent := d.stopAllPending()
+	if len(views) != 4 {
+		t.Fatalf("views 长度应为 4，实际 %d", len(views))
+	}
+	if sent != 3 {
+		t.Errorf("sent 应为 3（s2 被跳过），实际 %d", sent)
+	}
+
+	// s1/m1/st 仍能读出预期 reply
+	wantReply := map[string]string{
+		"s1": "deny",
+		"m1": "deny",
+		"st": "skip",
+	}
+	for id, want := range wantReply {
+		select {
+		case got := <-entries[id].reply:
+			if got != want {
+				t.Errorf("entries[%s].reply = %q, 期望 %q", id, got, want)
+			}
+		default:
+			t.Errorf("entries[%s].reply 应有值 %q，实际 chan 为空", id, want)
+		}
+	}
+	// s2 chan 里残留的应仍是预先塞入的 "allow"（stopAllPending 没覆盖它）
+	select {
+	case got := <-entries["s2"].reply:
+		if got != "allow" {
+			t.Errorf("s2.reply 应保留 race 原值 \"allow\"，实际 %q", got)
+		}
+	default:
+		t.Errorf("s2.reply 应有原值 \"allow\"")
+	}
+}
+
+func TestBuildStopCancelCard_Empty(t *testing.T) {
+	jsonStr := buildStopCancelCard(nil, 0)
+
+	var card map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &card); err != nil {
+		t.Fatalf("卡片 JSON 无效: %v", err)
+	}
+	hdr := card["header"].(map[string]interface{})
+	if hdr["template"] != "grey" {
+		t.Errorf("template = %v，期望 grey", hdr["template"])
+	}
+	title := hdr["title"].(map[string]interface{})["content"].(string)
+	if !strings.Contains(title, "ℹ️") {
+		t.Errorf("空 views 时 title 应含 ℹ️: %q", title)
+	}
+	if !strings.Contains(jsonStr, "没有需要取消") {
+		t.Errorf("空卡片 body 应含提示: %q", jsonStr)
+	}
+}
+
+func TestBuildStopCancelCard_WithItems(t *testing.T) {
+	now := time.Now().Unix()
+	views := []PendingView{
+		{ID: "req-1", Kind: "shell", Summary: "npm test", Workspace: "myproj", CreatedTS: now - 60},
+		{ID: "req-2", Kind: "mcp", Summary: "linear.list-issues", CreatedTS: now - 10},
+	}
+	jsonStr := buildStopCancelCard(views, 2)
+
+	var card map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &card); err != nil {
+		t.Fatalf("卡片 JSON 无效: %v", err)
+	}
+	hdr := card["header"].(map[string]interface{})
+	if hdr["template"] != "grey" {
+		t.Errorf("template = %v，期望 grey", hdr["template"])
+	}
+	title := hdr["title"].(map[string]interface{})["content"].(string)
+	if !strings.Contains(title, "🛑") {
+		t.Errorf("有 views 时 title 应含 🛑: %q", title)
+	}
+	// 应含 summary 文字和 kind 图标
+	for _, want := range []string{"npm test", "linear.list-issues", "🖥️", "🔧", "共 2 条", "已发送取消信号 2 条"} {
+		if !strings.Contains(jsonStr, want) {
+			t.Errorf("卡片应含 %q: %q", want, jsonStr)
+		}
+	}
+	// sent == len(views) 时不应出现 race 提示
+	if strings.Contains(jsonStr, "race 时可能已自行完成") {
+		t.Errorf("sent == len 时不应出现 race 提示: %q", jsonStr)
+	}
+}
+
+// 当 sent < len(views) 时卡片应额外提示 race 情况
+func TestBuildStopCancelCard_RaceHint(t *testing.T) {
+	now := time.Now().Unix()
+	views := []PendingView{
+		{ID: "req-1", Kind: "shell", Summary: "a", CreatedTS: now - 20},
+		{ID: "req-2", Kind: "shell", Summary: "b", CreatedTS: now - 10},
+	}
+	jsonStr := buildStopCancelCard(views, 1)
+	if !strings.Contains(jsonStr, "未发送的 1 条") {
+		t.Errorf("卡片应含 race 提示: %q", jsonStr)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -697,6 +698,54 @@ func (d *Daemon) snapshotPending() []PendingView {
 		})
 	}
 	return views
+}
+
+// stopAllPending 尝试取消所有 pending 操作，供 /stop 斜杠命令调用。
+//
+// 按 kind 分派 reply 内容：
+//   - kind == "stop"（on-stop.sh 的 waiter）→ 发 "skip"，让会话结束
+//   - 其它 kind（shell / mcp / ask / askQuestion / switchMode 等）→ 发 "deny"，
+//     让 hook 返回 {"decision":"deny"} 跳过底层动作
+//
+// 非阻塞 send：如果 reply chan 已被别的路径 send 过（race，例如用户刚好
+// 点了"允许"按钮进入 dispatchButtonReply 但 entry 还没 defer cleanup），
+// 本次会走 default 分支跳过，已有的 decision 继续在 pipeline 里流转。
+//
+// 不主动 delete pending 条目——waitReply 自己的 defer 负责清理，
+// 保持和 dispatchButtonReply / dispatchTextReply 一致的生命周期契约。
+//
+// 返回：被处理的 pending 快照切片（按 createdTS 升序）+ 实际 send 成功的条数。
+func (d *Daemon) stopAllPending() ([]PendingView, int) {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+
+	views := make([]PendingView, 0, len(d.pending))
+	sent := 0
+	for _, e := range d.pending {
+		reply := "deny"
+		if e.kind == "stop" {
+			reply = "skip"
+		}
+		select {
+		case e.reply <- reply:
+			sent++
+		default:
+			logInfo("/stop: pending %s (kind=%s) chan 已满，跳过", e.id, e.kind)
+		}
+		views = append(views, PendingView{
+			ID:        e.id,
+			Kind:      e.kind,
+			Summary:   e.summary,
+			Workspace: e.workspace,
+			Agent:     e.agent,
+			CreatedTS: e.createdTS,
+		})
+	}
+
+	sort.Slice(views, func(i, j int) bool {
+		return views[i].CreatedTS < views[j].CreatedTS
+	})
+	return views, sent
 }
 
 // ── lark-cli 发消息 ──
