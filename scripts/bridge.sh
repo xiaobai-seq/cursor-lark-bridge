@@ -8,6 +8,7 @@
 #   bridge.sh status  — 查看状态
 #   bridge.sh restart — 重启 daemon
 #   bridge.sh doctor  — 诊断冲突进程并可选一键修复
+#   bridge.sh service {...} — 安装/管理 launchd service
 
 set -u
 
@@ -558,6 +559,163 @@ cmd_doctor() {
 }
 
 # ─────────────────────────────────────────────
+# service 子命令：launchd 托管
+# ─────────────────────────────────────────────
+
+LAUNCHD_LABEL="com.cursor.feishu-bridge"
+PLIST_INSTALL_PATH="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+
+# 定位 plist 模板（已安装路径优先，fallback 到仓库布局）
+find_plist_template() {
+    for candidate in \
+        "$BRIDGE_DIR/launchd/${LAUNCHD_LABEL}.plist.template" \
+        "$SCRIPT_DIR/../launchd/${LAUNCHD_LABEL}.plist.template"; do
+        [ -f "$candidate" ] && { echo "$candidate"; return; }
+    done
+    return 1
+}
+
+render_plist() {
+    local template="$1" dest="$2"
+    # 替换 __HOME__ 为真实 $HOME；用 # 作为 sed 分隔符，避免路径里的 / 需要转义
+    sed "s#__HOME__#${HOME}#g" "$template" > "$dest"
+}
+
+cmd_service_install() {
+    local template
+    template=$(find_plist_template) || {
+        echo -e "${RED}找不到 plist 模板（期望在 $BRIDGE_DIR/launchd/ 或 $SCRIPT_DIR/../launchd/）${NC}"
+        exit 1
+    }
+
+    mkdir -p "$HOME/Library/LaunchAgents" "$BRIDGE_DIR/logs"
+
+    # 已安装则先备份
+    if [ -f "$PLIST_INSTALL_PATH" ]; then
+        local backup="${PLIST_INSTALL_PATH}.bak.$(date +%Y%m%d_%H%M%S)"
+        cp "$PLIST_INSTALL_PATH" "$backup"
+        echo -e "  ${YELLOW}⚠${NC} 已有 plist，备份到 $backup"
+        # 先 unload 旧的（忽略失败）
+        launchctl unload "$PLIST_INSTALL_PATH" 2>/dev/null || true
+    fi
+
+    render_plist "$template" "$PLIST_INSTALL_PATH"
+    # 校验 plist 合法性，失败就回滚
+    if ! plutil -lint "$PLIST_INSTALL_PATH" >/dev/null 2>&1; then
+        echo -e "  ${RED}✗${NC} 渲染后的 plist 校验失败，请检查模板"
+        rm -f "$PLIST_INSTALL_PATH"
+        exit 1
+    fi
+
+    # 如果当前有手工启动的 daemon，先停掉再交给 launchd（避免双实例被 PID lock 互相挡）
+    if is_daemon_running; then
+        echo -e "  ${YELLOW}⚠${NC} 检测到手工启动的 daemon，先停止再交给 launchd 接管"
+        kill_daemon 2>/dev/null || true
+    fi
+
+    launchctl load "$PLIST_INSTALL_PATH"
+    echo -e "  ${GREEN}✓${NC} 已加载 launchd service：$LAUNCHD_LABEL"
+    echo -e "  ${GREEN}✓${NC} 开机自启 + 崩溃自恢复已生效"
+    echo -e "  日志位置：$BRIDGE_DIR/logs/launchd-{stdout,stderr}.log"
+
+    sleep 2
+    if is_daemon_running; then
+        echo -e "  ${GREEN}✓${NC} daemon 已通过 launchd 运行 (PID=$(cat "$PID_FILE" 2>/dev/null | head -1))"
+    else
+        echo -e "  ${YELLOW}⚠${NC} daemon 尚未启动，可通过 ${CYAN}fb service logs${NC} 查看 launchd 错误"
+    fi
+}
+
+cmd_service_uninstall() {
+    if [ ! -f "$PLIST_INSTALL_PATH" ]; then
+        echo -e "${YELLOW}未安装 launchd service（$PLIST_INSTALL_PATH 不存在）${NC}"
+        return 0
+    fi
+    launchctl unload "$PLIST_INSTALL_PATH" 2>/dev/null || true
+    rm -f "$PLIST_INSTALL_PATH"
+    echo -e "${GREEN}✓ 已卸载 launchd service${NC}"
+    echo -e "  ${BLUE}说明${NC}：数据目录 $BRIDGE_DIR 保留；如需彻底清理请参考 install.sh --uninstall"
+}
+
+cmd_service_start() {
+    if [ ! -f "$PLIST_INSTALL_PATH" ]; then
+        echo -e "${RED}未安装 launchd service，请先运行 ${CYAN}fb service install${NC}"
+        exit 1
+    fi
+    launchctl start "$LAUNCHD_LABEL"
+    echo -e "${GREEN}✓ 已请求 launchd 启动 $LAUNCHD_LABEL${NC}"
+}
+
+cmd_service_stop() {
+    if [ ! -f "$PLIST_INSTALL_PATH" ]; then
+        echo -e "${YELLOW}未安装 launchd service${NC}"
+        return 0
+    fi
+    launchctl stop "$LAUNCHD_LABEL"
+    echo -e "${GREEN}✓ 已请求 launchd 停止 $LAUNCHD_LABEL${NC}"
+    echo -e "  ${YELLOW}注意${NC}：plist 的 KeepAlive.Crashed=true，daemon 可能被再次拉起。彻底停止请用 ${CYAN}fb service uninstall${NC}"
+}
+
+cmd_service_status() {
+    if [ ! -f "$PLIST_INSTALL_PATH" ]; then
+        echo -e "launchd service: ${YELLOW}未安装${NC}"
+        return 0
+    fi
+    if launchctl list "$LAUNCHD_LABEL" >/dev/null 2>&1; then
+        echo -e "launchd service: ${GREEN}已加载${NC}"
+        launchctl list "$LAUNCHD_LABEL" | sed 's/^/  /'
+    else
+        echo -e "launchd service: ${YELLOW}已安装但未加载${NC}"
+    fi
+}
+
+cmd_service_logs() {
+    local which="${1:-out}" file
+    case "$which" in
+        out|stdout) file="$BRIDGE_DIR/logs/launchd-stdout.log" ;;
+        err|stderr) file="$BRIDGE_DIR/logs/launchd-stderr.log" ;;
+        *)
+            echo "用法: fb service logs [out|err]  (默认 out)"
+            return 1
+            ;;
+    esac
+    if [ ! -f "$file" ]; then
+        echo -e "${YELLOW}日志文件尚不存在：$file${NC}"
+        return 0
+    fi
+    tail -n 50 "$file"
+}
+
+cmd_service() {
+    local sub="${1:-}"
+    case "$sub" in
+        install)    cmd_service_install ;;
+        uninstall)  cmd_service_uninstall ;;
+        start)      cmd_service_start ;;
+        stop)       cmd_service_stop ;;
+        status)     cmd_service_status ;;
+        logs)       shift; cmd_service_logs "$@" ;;
+        ""|help|-h|--help)
+            cat <<EOF
+用法: fb service {install|uninstall|start|stop|status|logs [out|err]}
+
+  install    将 daemon 注册为 launchd user agent（开机自启 + 崩溃恢复）
+  uninstall  卸载 launchd service，保留数据目录
+  start      请求 launchd 启动 daemon（已有 KeepAlive 通常不需要）
+  stop       请求 launchd 停止 daemon（Crashed=true 可能立即重启）
+  status     查看 launchd 加载状态
+  logs [out|err]  打印 launchd stdout/stderr 日志最后 50 行
+EOF
+            ;;
+        *)
+            echo "未知 service 子命令: $sub"
+            echo "运行 fb service help 查看用法"
+            exit 1
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────
 # init 子命令：交互引导配置
 # ─────────────────────────────────────────────
 
@@ -809,8 +967,12 @@ case "${1:-}" in
         shift
         cmd_doctor "$@"
         ;;
+    service)
+        shift
+        cmd_service "$@"
+        ;;
     *)
-        echo "用法: $0 {init|start|stop|kill|restart|status|doctor}"
+        echo "用法: $0 {init|start|stop|kill|restart|status|doctor|service}"
         echo ""
         echo "  init    — 首次引导配置（open_id + hooks.json 合并）"
         echo "  start   — 启动 daemon 并激活远程模式"
@@ -819,6 +981,7 @@ case "${1:-}" in
         echo "  restart — 重启 daemon 并激活远程模式"
         echo "  status  — 查看当前状态"
         echo "  doctor  — 诊断冲突进程，加 --fix 可一键修复"
+        echo "  service — 安装 launchd 自启 + 崩溃恢复，见 'fb service help'"
         exit 1
         ;;
 esac

@@ -294,6 +294,14 @@ deploy_files() {
     install -m 0644 "$EXTRACTED_DIR/config/hooks-additions.json" "$BRIDGE_DIR/hooks-additions.json"
     ok "installed hooks-additions.json"
 
+    # launchd plist template (used later by `fb service install`)
+    if [ -f "$EXTRACTED_DIR/launchd/com.cursor.feishu-bridge.plist.template" ]; then
+        mkdir -p "$BRIDGE_DIR/launchd"
+        install -m 0644 "$EXTRACTED_DIR/launchd/com.cursor.feishu-bridge.plist.template" \
+            "$BRIDGE_DIR/launchd/com.cursor.feishu-bridge.plist.template"
+        ok "installed launchd plist template"
+    fi
+
     # hook scripts
     for f in "$EXTRACTED_DIR"/hooks/*.sh "$EXTRACTED_DIR"/hooks/*.py; do
         [ -f "$f" ] || continue
