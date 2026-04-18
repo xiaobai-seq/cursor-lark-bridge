@@ -30,14 +30,34 @@ BLUE=$'\033[0;34m'
 CYAN=$'\033[0;36m'
 NC=$'\033[0m'
 
+# read_pid_from_file：从 PID 文件中提取数字 PID。
+# 优先按 JSON 解析（v0.2+ 的 schema：{"pid":..., "start_ts":..., ...}），
+# 解析失败时 fallback 为首行裸数字（兼容 v0.1.x 的单行 PID 格式）。
+# 参数：$1=PID 文件路径；stdout：数字 PID（解析失败为空串）
+read_pid_from_file() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    python3 - "$file" 2>/dev/null <<'PYEOF' || { head -1 "$file" 2>/dev/null | tr -d '[:space:]'; }
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    pid = int(d.get('pid', 0))
+    if pid > 0:
+        print(pid)
+    else:
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
 is_daemon_running() {
-    if [ -f "$PID_FILE" ]; then
-        pid=$(cat "$PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            return 0
-        fi
-    fi
-    return 1
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid=$(read_pid_from_file "$PID_FILE")
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null
 }
 
 # list_matching_pids <regex>
@@ -269,7 +289,29 @@ kill_daemon() {
 show_status() {
     echo -e "${BLUE}=== cursor-lark-bridge 状态 ===${NC}"
     if is_daemon_running; then
-        echo -e "Daemon:      ${GREEN}运行中${NC} (PID=$(cat "$PID_FILE"))"
+        local pid meta
+        pid=$(read_pid_from_file "$PID_FILE")
+        echo -e "Daemon:      ${GREEN}运行中${NC} (PID=$pid)"
+        # JSON 格式（v0.2+）才能拿到 start_ts / reconnect_count；legacy 单行 PID 跳过
+        meta=$(python3 - "$PID_FILE" 2>/dev/null <<'PYEOF'
+import json, sys, time
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    lines = []
+    if 'start_ts' in d:
+        up = int(time.time()) - int(d.get('start_ts', 0))
+        h, rem = divmod(up, 3600)
+        m, _ = divmod(rem, 60)
+        lines.append(f"Uptime:      {h}h {m}m")
+    if 'reconnect_count' in d:
+        lines.append(f"Reconnects:  {d.get('reconnect_count', 0)}")
+    print('\n'.join(lines))
+except Exception:
+    pass
+PYEOF
+)
+        [ -n "$meta" ] && echo -e "$meta"
     else
         echo -e "Daemon:      ${RED}未运行${NC}"
         return

@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -215,42 +214,8 @@ func (d *Daemon) saveState() {
 	os.WriteFile(filepath.Join(d.baseDir, stateFileName), data, 0644)
 }
 
-// acquirePIDLock 检查是否已有活 daemon，没有则写入自己的 PID
-// 返回非 nil error 时 daemon 必须退出，防止并发启动互相踩（例如同时启动会清理对方的 lark-cli 子进程）
-func (d *Daemon) acquirePIDLock() error {
-	p := filepath.Join(d.baseDir, pidFileName)
-	if data, err := os.ReadFile(p); err == nil {
-		pidStr := strings.TrimSpace(string(data))
-		if pidStr != "" {
-			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 && pid != os.Getpid() {
-				if proc, err := os.FindProcess(pid); err == nil {
-					// Signal(0) 不实际发信号，仅探测进程是否存活
-					if proc.Signal(syscall.Signal(0)) == nil {
-						return fmt.Errorf("另一个 daemon 已在运行 (PID=%d)，请先 `fb kill` 再启动", pid)
-					}
-				}
-			}
-		}
-	}
-	// 写入当前 PID；目录不存在时先创建，避免 PID 文件写入失败
-	if err := os.MkdirAll(d.baseDir, 0755); err != nil {
-		return fmt.Errorf("创建 %s 失败: %w", d.baseDir, err)
-	}
-	return os.WriteFile(p, []byte(strconv.Itoa(os.Getpid())), 0644)
-}
-
-func (d *Daemon) removePID() {
-	// 仅在 PID 文件里记录的仍是自己时才删除，防止并发重启下覆盖掉后来者的 PID
-	p := filepath.Join(d.baseDir, pidFileName)
-	if data, err := os.ReadFile(p); err == nil {
-		if pidStr := strings.TrimSpace(string(data)); pidStr != "" {
-			if pid, err := strconv.Atoi(pidStr); err == nil && pid != os.Getpid() {
-				return
-			}
-		}
-	}
-	os.Remove(p)
-}
+// pid 文件相关逻辑（acquire/remove/update）已抽到 pidfile.go，
+// 并从单行 PID 升级为 JSON schema（向后兼容 legacy 单行 PID）
 
 func (d *Daemon) nextRequestID(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, d.reqSeq.Add(1))
@@ -1139,11 +1104,11 @@ func main() {
 
 	logInfo("cursor-lark-bridge daemon 启动中... (version=%s)", version)
 	d := newDaemon()
-	if err := d.acquirePIDLock(); err != nil {
+	if err := acquirePIDLockV2(d.baseDir); err != nil {
 		logErr("%v", err)
 		os.Exit(1)
 	}
-	defer d.removePID()
+	defer removePIDV2(d.baseDir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
