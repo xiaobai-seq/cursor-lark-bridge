@@ -29,9 +29,10 @@ type SlashReply struct {
 	CardJSON string
 }
 
-// slashRegistry 是斜杠命令注册表，后续 P2.4/P2.5/P2.6 继续 append 即可。
+// slashRegistry 是斜杠命令注册表，后续 P2.5/P2.6 继续 append 即可。
 var slashRegistry = []SlashCommand{
 	&pingCommand{},
+	&statusCommand{},
 }
 
 // normalizeSlash 把输入文本归一化为斜杠命令形态：
