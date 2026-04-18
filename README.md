@@ -90,6 +90,30 @@ While remote mode is **active**, every Cursor hook is routed through Feishu. Whe
 
 `fb status` reports a three-tier health for the event subscription: **healthy** (stable for >2 s and receiving events/heartbeats), **unstable** (currently restarting — usually a conflicting subscriber holding the slot), **not running** (the `lark-cli` child process is gone). Anything other than "healthy" → run `fb doctor`.
 
+## Auto-start + crash recovery (launchd)
+
+Since v0.2 the daemon can register as a **User LaunchAgent** for auto-start at
+login and automatic crash recovery within ~10s.
+
+```bash
+fb service install     # install plist and launchctl load
+fb service status      # show launchd load state
+fb service logs        # tail launchd stdout (use `logs err` for stderr)
+fb service uninstall   # remove the plist (data dir preserved)
+```
+
+After install:
+
+- **Logs** land in `~/.cursor/cursor-lark-bridge/logs/daemon-YYYY-MM-DD.log`
+  (per-day rotation, 7-day retention).
+- launchd's own stdout/stderr go to `logs/launchd-{stdout,stderr}.log`.
+- `fb start` keeps working: it only flips the "remote mode" flag — the daemon
+  itself is now supervised by launchd.
+- `fb kill` stops the daemon, but launchd will bring it back within
+  `ThrottleInterval=10` seconds. To fully stop, run `fb service uninstall`.
+
+The daemon comes back on its own after reboots — no manual step needed.
+
 ## Running multiple Cursor agents in parallel
 
 Each hook automatically tags the card with a short label derived from the workspace + conversation ID, e.g. `my-project · #dfc1e56a`. If you want a friendlier name:
