@@ -28,6 +28,9 @@ const (
 	stateFileName  = "state.json"
 	pidFileName    = "daemon.pid"
 	approveTimeout = 10 * time.Minute
+	// supervisor 指数退避：2s → 4s → ... → 5min 封顶
+	supervisorInitialBackoff = 2 * time.Second
+	supervisorMaxBackoff     = 5 * time.Minute
 )
 
 // ── 配置 & 状态 ──
@@ -245,20 +248,32 @@ func (d *Daemon) startEventSubscription(ctx context.Context) {
 	cleanupStaleLarkCLIEvent("startup")
 
 	go func() {
+		// supervisor 的 backoff 状态仅在本 goroutine 内使用，无需加锁
+		backoff := newBackoff(supervisorInitialBackoff, supervisorMaxBackoff)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
-			d.runOneSubscription(ctx)
-			sleepCtx(ctx, 3*time.Second)
+			// 每次尝试启动子进程前把 reconnect_count 持久化到 pid 文件
+			// 注意：第一次启动也会递增到 1（而不是 0），这是刻意的 —— 代表"这次启动是第 N 次尝试"
+			if err := updatePIDFile(d.baseDir, func(info *PIDInfo) {
+				info.ReconnectCount++
+			}); err != nil {
+				logErr("更新 daemon.pid reconnect_count 失败: %v", err)
+			}
+			d.runOneSubscription(ctx, backoff)
+			wait := backoff.Next()
+			logInfo("下次重连在 %v 后...", wait)
+			sleepCtx(ctx, wait)
 		}
 	}()
 }
 
-// runOneSubscription 启动一次 lark-cli event +subscribe 子进程并阻塞到它退出
-func (d *Daemon) runOneSubscription(ctx context.Context) {
+// runOneSubscription 启动一次 lark-cli event +subscribe 子进程并阻塞到它退出。
+// backoff 由 supervisor 持有并传入，readEvents 收到首条事件时会在其上调 Reset。
+func (d *Daemon) runOneSubscription(ctx context.Context, backoff *backoffState) {
 	logInfo("启动 lark-cli event +subscribe ...")
 	cmd := exec.CommandContext(ctx, "lark-cli", "event", "+subscribe",
 		"--event-types", "im.message.receive_v1,card.action.trigger",
@@ -297,7 +312,7 @@ func (d *Daemon) runOneSubscription(ctx context.Context) {
 		}
 	})
 
-	d.readEvents(ctx, stdout)
+	d.readEvents(ctx, stdout, backoff)
 	cmd.Wait()
 	stableTimer.Stop()
 	d.subscribeOK.Store(false)
@@ -310,7 +325,7 @@ func (d *Daemon) runOneSubscription(ctx context.Context) {
 		cleanupStaleLarkCLIEvent("conflict")
 	}
 
-	logInfo("lark-cli event +subscribe 已退出，3 秒后重启...")
+	logInfo("lark-cli event +subscribe 已退出")
 }
 
 // cleanupStaleLarkCLIEvent 尽力清理可能遗留的 lark-cli event +subscribe 进程
@@ -389,9 +404,13 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (d *Daemon) readEvents(ctx context.Context, r io.Reader) {
+// readEvents 循环读取 lark-cli 子进程 stdout。
+// 每次调用（= 每个 lark-cli 子进程生命周期）内第一条非空事件会调 backoff.Reset()，
+// 视为"订阅重新稳定"的信号，让下一次重连回到 initial backoff。
+func (d *Daemon) readEvents(ctx context.Context, r io.Reader, backoff *backoffState) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	firstEvent := true
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -405,6 +424,13 @@ func (d *Daemon) readEvents(ctx context.Context, r io.Reader) {
 
 		// 任何事件进入都更新时间戳，用于 /health 的真实健康探针
 		d.lastEventAt.Store(time.Now().UnixMilli())
+		if firstEvent {
+			firstEvent = false
+			if backoff != nil {
+				backoff.Reset()
+			}
+			logInfo("收到首条事件，重置重连退避")
+		}
 
 		// 先解析 type 字段判断事件类型
 		var base struct {
