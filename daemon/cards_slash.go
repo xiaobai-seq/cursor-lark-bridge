@@ -16,6 +16,9 @@ type statusCommand struct{}
 func (c *statusCommand) Name() string        { return "status" }
 func (c *statusCommand) Aliases() []string   { return []string{"/状态"} }
 func (c *statusCommand) Match(n string) bool { return matchByNameOrAlias(c, n) }
+func (c *statusCommand) Description() string {
+	return "查看 daemon 健康度 + 所有待处理 pending"
+}
 func (c *statusCommand) Execute(d *Daemon) SlashReply {
 	return SlashReply{CardJSON: buildStatusCard(d)}
 }
@@ -164,6 +167,9 @@ type stopCommand struct{}
 func (c *stopCommand) Name() string        { return "stop" }
 func (c *stopCommand) Aliases() []string   { return []string{"/停止"} }
 func (c *stopCommand) Match(n string) bool { return matchByNameOrAlias(c, n) }
+func (c *stopCommand) Description() string {
+	return "取消所有待处理 pending（Shell/MCP 发 deny；Agent 停止发 skip）"
+}
 func (c *stopCommand) Execute(d *Daemon) SlashReply {
 	views, sent := d.stopAllPending()
 	return SlashReply{CardJSON: buildStopCancelCard(views, sent)}
@@ -218,6 +224,64 @@ func buildStopCancelCard(views []PendingView, sent int) string {
 					map[string]interface{}{
 						"tag":     "plain_text",
 						"content": "💬 /status 查看剩余 · /help 查看命令",
+					},
+				},
+			},
+		},
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(card)
+	return strings.TrimRight(buf.String(), "\n")
+}
+
+// buildHelpCard 渲染命令清单卡片。
+//
+// 卡片结构：
+//   - header: blue 模板 + "📖 可用命令"
+//   - div: 每条命令一行 —— **`/Name`**（/alias1 / /alias2 …）— Description
+//   - hr
+//   - note: 底部提示（大小写、全角斜杠）
+//
+// alias 列表保持 Aliases() 里的顺序，统一补齐前导半角 `/`
+// （Aliases 里可能是 "/状态" 也可能是 "状态" 或 "／状态"）
+func buildHelpCard(cmds []SlashCommand) string {
+	lines := make([]string, 0, len(cmds)+1)
+	lines = append(lines, "**可用命令**")
+	for _, cmd := range cmds {
+		main := "/" + cmd.Name()
+		aliases := cmd.Aliases()
+		if len(aliases) > 0 {
+			norm := make([]string, 0, len(aliases))
+			for _, a := range aliases {
+				s := strings.TrimPrefix(a, "/")
+				s = strings.TrimPrefix(s, "／")
+				norm = append(norm, "/"+s)
+			}
+			lines = append(lines, fmt.Sprintf("**`%s`**（%s）— %s",
+				main, strings.Join(norm, " / "), cmd.Description()))
+		} else {
+			lines = append(lines, fmt.Sprintf("**`%s`** — %s", main, cmd.Description()))
+		}
+	}
+	body := strings.Join(lines, "\n")
+
+	card := map[string]interface{}{
+		"config": map[string]interface{}{"wide_screen_mode": true},
+		"header": map[string]interface{}{
+			"title":    map[string]interface{}{"tag": "plain_text", "content": "📖 可用命令"},
+			"template": "blue",
+		},
+		"elements": []interface{}{
+			map[string]interface{}{"tag": "div", "text": map[string]interface{}{"tag": "lark_md", "content": body}},
+			map[string]interface{}{"tag": "hr"},
+			map[string]interface{}{
+				"tag": "note",
+				"elements": []interface{}{
+					map[string]interface{}{
+						"tag":     "plain_text",
+						"content": "💡 命令不区分大小写；全角斜杠／也支持",
 					},
 				},
 			},

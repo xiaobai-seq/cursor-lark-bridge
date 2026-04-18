@@ -109,6 +109,7 @@ func (m *mockCmd) Name() string                 { return m.name }
 func (m *mockCmd) Aliases() []string            { return m.aliases }
 func (m *mockCmd) Match(n string) bool          { return matchByNameOrAlias(m, n) }
 func (m *mockCmd) Execute(d *Daemon) SlashReply { return SlashReply{} }
+func (m *mockCmd) Description() string          { return "" }
 
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (len(sub) == 0 || indexOf(s, sub) >= 0)

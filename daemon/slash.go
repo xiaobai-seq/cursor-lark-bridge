@@ -20,6 +20,8 @@ type SlashCommand interface {
 	Match(normalized string) bool
 	// Execute 产出要回复给用户的消息。返回 nil 表示不回复。
 	Execute(d *Daemon) SlashReply
+	// Description 返回一句话说明，供 /help 渲染
+	Description() string
 }
 
 // SlashReply 是命令的回复载体：text 非空就发文字、cardJSON 非空就发卡片。
@@ -29,11 +31,14 @@ type SlashReply struct {
 	CardJSON string
 }
 
-// slashRegistry 是斜杠命令注册表，后续 P2.6 继续 append 即可。
+// slashRegistry 是斜杠命令注册表。
+// 顺序决定 /help 输出顺序，也决定 routeSlash 的匹配顺序
+// （但每个命令的 Match 目前都走精确比较，不会冲突）
 var slashRegistry = []SlashCommand{
 	&pingCommand{},
 	&statusCommand{},
 	&stopCommand{},
+	&helpCommand{},
 }
 
 // normalizeSlash 把输入文本归一化为斜杠命令形态：
@@ -113,13 +118,15 @@ func matchByNameOrAlias(cmd SlashCommand, normalized string) bool {
 
 // ── /ping ──
 // 最小的命令，验证整个框架通畅。
-// 后续 /status /stop /help 在本 task 之后的 task 追加
 
 type pingCommand struct{}
 
 func (c *pingCommand) Name() string        { return "ping" }
 func (c *pingCommand) Aliases() []string   { return nil }
 func (c *pingCommand) Match(n string) bool { return matchByNameOrAlias(c, n) }
+func (c *pingCommand) Description() string {
+	return "探活 daemon，返回 version / uptime / reconnect / subscribe 状态"
+}
 func (c *pingCommand) Execute(d *Daemon) SlashReply {
 	up := d.uptime()
 	upStr := formatDuration(up)
@@ -129,6 +136,22 @@ func (c *pingCommand) Execute(d *Daemon) SlashReply {
 			version, upStr, d.restartCount.Load(), d.subscribeOK.Load(),
 		),
 	}
+}
+
+// ── /help ──
+// 列出所有注册命令（含中文别名 + Description），供用户随时查询。
+// 输出顺序即 slashRegistry 的注册顺序
+
+type helpCommand struct{}
+
+func (c *helpCommand) Name() string        { return "help" }
+func (c *helpCommand) Aliases() []string   { return []string{"/帮助", "/指令"} }
+func (c *helpCommand) Match(n string) bool { return matchByNameOrAlias(c, n) }
+func (c *helpCommand) Description() string {
+	return "显示所有可用命令（含中文别名）"
+}
+func (c *helpCommand) Execute(d *Daemon) SlashReply {
+	return SlashReply{CardJSON: buildHelpCard(slashRegistry)}
 }
 
 // formatDuration 把 Duration 格式化为 "1h23m" / "1m30s" / "45s" 风格。
