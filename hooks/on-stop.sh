@@ -46,8 +46,21 @@ fi
 
 # 无摘要也继续（比如 Agent 只调了工具没说话）—— 卡片会显示默认文案
 
+# 从 stdin 抽 workspace（与其他 hook 保持一致；daemon 侧用它做 /status 展示）
+WORKSPACE=$(echo "$input" | python3 -c "
+import sys, json, os
+try:
+    d = json.load(sys.stdin)
+    roots = d.get('workspace_roots') or []
+    root_path = (roots[0] if roots else '') or ''
+    root_path = root_path.rstrip('/')
+    print(os.path.basename(root_path))
+except Exception:
+    pass
+" 2>/dev/null)
+
 # 4. 调用 daemon /stop 端点，发送暂停卡片并阻塞等回复
-resp=$(STATUS="$status" LOOP_COUNT="$loop_count" SUMMARY="$summary" AGENT_LABEL="$AGENT_LABEL" python3 <<'PYEOF'
+resp=$(STATUS="$status" LOOP_COUNT="$loop_count" SUMMARY="$summary" AGENT_LABEL="$AGENT_LABEL" WORKSPACE="$WORKSPACE" python3 <<'PYEOF'
 import json, os, urllib.request, urllib.error, sys
 
 body = json.dumps({
@@ -55,6 +68,8 @@ body = json.dumps({
     "loop_count": int(os.environ.get("LOOP_COUNT", "0") or 0),
     "summary": os.environ.get("SUMMARY", ""),
     "agent": os.environ.get("AGENT_LABEL", ""),
+    "kind": "stop",
+    "workspace": os.environ.get("WORKSPACE", ""),
 }).encode("utf-8")
 
 req = urllib.request.Request(

@@ -21,19 +21,36 @@ if [ "$active" != "True" ]; then
 fi
 
 body=$(echo "$input" | python3 -c "
-import sys, json, os
+import sys, json, os, re
 d = json.load(sys.stdin)
 tool_name = d.get('tool_name', '')
 tool_input = d.get('tool_input', '{}')
+
+# workspace 提取（与其他 hook 一致）
+roots = d.get('workspace_roots') or []
+root_path = (roots[0] if roots else '') or ''
+root_path = root_path.rstrip('/')
+workspace = os.path.basename(root_path)
+
+# 脱敏：JSON 场景（含引号）也要覆盖 api_key / password / token / secret / bearer
+SENSITIVE = re.compile(r'((?:api[_-]?key|password|token|secret|bearer)[\"\s:=]+)\"?[^\"\s,\}]+', re.IGNORECASE)
 if isinstance(tool_input, dict):
-    ti_str = json.dumps(tool_input, ensure_ascii=False)[:500]
+    ti_str = json.dumps(tool_input, ensure_ascii=False)
 else:
-    ti_str = str(tool_input)[:500]
+    ti_str = str(tool_input)
+ti_str = SENSITIVE.sub(r'\1***', ti_str)[:500]
+
+# summary：仅用工具名即可（tool_input 可能含敏感信息，不放 summary）
+summary = tool_name[:80]
+
 print(json.dumps({
     'type': 'mcp',
+    'kind': 'mcp',
     'title': '🔧 MCP 工具调用待授权',
     'content': f'**工具** \`{tool_name}\`\n**参数摘要**\n\`\`\`\n{ti_str}\n\`\`\`',
     'context': 'MCP 工具调用',
+    'summary': summary,
+    'workspace': workspace,
     'agent': os.environ.get('AGENT_LABEL', ''),
 }))
 " 2>/dev/null)
