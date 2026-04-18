@@ -61,12 +61,24 @@ except Exception:
 
 # 4. 调用 daemon /stop 端点，发送暂停卡片并阻塞等回复
 resp=$(STATUS="$status" LOOP_COUNT="$loop_count" SUMMARY="$summary" AGENT_LABEL="$AGENT_LABEL" WORKSPACE="$WORKSPACE" python3 <<'PYEOF'
-import json, os, urllib.request, urllib.error, sys
+import json, os, re, urllib.request, urllib.error, sys
+
+# 脱敏：v1 的 on-stop summary 直接是 Agent 最后输出，未做脱敏。P2.1 之后这份 summary
+# 既会进 daemon /status snapshot，也会被 buildStopCard 展示回飞书卡片——Agent 偶尔会
+# 把 curl -H "Bearer ..." 之类的命令原文印到末段总结里，补一道防御性脱敏。
+# 正则与 shell-approve / pretool-approve 同源，保证行为一致。
+SENSITIVE = re.compile(
+    r'((?:api[_-]?key|password|token|secret|key|bearer)[=:\s]+)[^\s]+',
+    re.IGNORECASE,
+)
+
+raw_summary = os.environ.get("SUMMARY", "")
+safe_summary = SENSITIVE.sub(r'\1***', raw_summary)
 
 body = json.dumps({
     "status": os.environ.get("STATUS", ""),
     "loop_count": int(os.environ.get("LOOP_COUNT", "0") or 0),
-    "summary": os.environ.get("SUMMARY", ""),
+    "summary": safe_summary,
     "agent": os.environ.get("AGENT_LABEL", ""),
     "kind": "stop",
     "workspace": os.environ.get("WORKSPACE", ""),

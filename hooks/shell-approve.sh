@@ -45,12 +45,15 @@ workspace = os.path.basename(root_path)
 SENSITIVE = re.compile(r'((?:api[_-]?key|password|token|secret|key|bearer)[=:\s]+)[^\s]+', re.IGNORECASE)
 safe_cmd = SENSITIVE.sub(r'\1***', cmd)
 
-# summary：脱敏后命令头 80 字 + @ cwd basename
+# summary：脱敏后命令头 80 字 + @ cwd basename；拼接 cwd 后必须再做一次整体截断，
+# 防止 summary_cmd 本身接近 80 字、拼上 ' @ xxx' 后溢出 daemon /status 展示宽度
 summary_cmd = safe_cmd.replace('\n', ' ').strip()
 if len(summary_cmd) > 80:
     summary_cmd = summary_cmd[:77] + '...'
 cwd_base = os.path.basename(cwd.rstrip('/')) if cwd else ''
 summary = f'{summary_cmd} @ {cwd_base}' if cwd_base else summary_cmd
+if len(summary) > 80:
+    summary = summary[:77] + '...'
 
 print(json.dumps({
     'type': 'shell',

@@ -32,7 +32,11 @@ root_path = (roots[0] if roots else '') or ''
 root_path = root_path.rstrip('/')
 workspace = os.path.basename(root_path)
 
-# 脱敏：JSON 场景（含引号）也要覆盖 api_key / password / token / secret / bearer
+# 脱敏：JSON 场景（含引号）覆盖 api_key / password / token / secret / bearer。
+# 注意：本正则刻意不收录单独的 "key"——JSON 里 "key": "value" 在 MCP 工具参数里太常见
+# （如用户主键、issue 标识、字段名、排序键），误伤率远超保护价值。真正的敏感字段通常叫
+# api_key / api-key / api key，已由 api[_-]?key 模式覆盖。若未来发现误露凭据，优先在
+# Agent 层或此处单独收紧，而不是在这里放开 "key"。该决策在 P2.2 rework 时由 Planner 裁定。
 SENSITIVE = re.compile(r'((?:api[_-]?key|password|token|secret|bearer)[\"\s:=]+)\"?[^\"\s,\}]+', re.IGNORECASE)
 if isinstance(tool_input, dict):
     ti_str = json.dumps(tool_input, ensure_ascii=False)
