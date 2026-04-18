@@ -3,8 +3,9 @@
 #
 # 默认模式 (smoke)：只跑静态校验 + 单元测试，完全不触碰 launchctl 和用户系统
 # --real 模式：启用真实 launchd 安装/崩溃恢复/卸载；脚本会自动备份并恢复用户
-#             已有的 ~/Library/LaunchAgents/com.cursor.feishu-bridge.plist
-#             以及 ~/.cursor/cursor-lark-bridge/daemon.pid（如果存在）
+#             已有的 ~/Library/LaunchAgents/com.cursor.feishu-bridge.plist、
+#             daemon.pid 以及 daemon 二进制，并在备份后用本分支代码重新
+#             编译部署 daemon，保证测的是本分支（而非 install.sh 装的旧版）
 #
 # 用法：
 #   bash tests/p0-e2e.sh            # 安全默认
@@ -101,11 +102,12 @@ real_confirm_or_exit() {
 
 ${YELLOW}⚠ --real 模式将会：${NC}
   1. 备份并删除你现有的 ~/Library/LaunchAgents/com.cursor.feishu-bridge.plist（如有）
-  2. 备份你现有的 ~/.cursor/cursor-lark-bridge/daemon.pid（如有）
-  3. 安装本仓库的 plist 并 launchctl load
-  4. 等 launchd 自动启动 daemon (~5s)
-  5. pkill -9 daemon，等 15s 观察 launchd 是否拉起
-  6. uninstall + 恢复原有 plist + daemon.pid
+  2. 备份你现有的 daemon.pid 和 daemon 二进制
+  3. 用本分支代码重新编译 daemon 并部署到 ~/.cursor/cursor-lark-bridge/daemon/
+  4. 安装本仓库的 plist 并 launchctl load
+  5. 等 launchd 自动启动 daemon (~5s)
+  6. pkill -9 daemon，等 20s 观察 launchd 是否拉起
+  7. uninstall + 恢复原有 plist + daemon.pid + daemon 二进制
 
 ${RED}过程中你已有的 daemon 会被重启（短暂不可用）。${NC}
 ${RED}如果你当前正在用飞书桥审批操作，请停止 --real 测试，等任务结束再跑。${NC}
@@ -121,6 +123,32 @@ EOF
 
 BACKUP_DIR=""
 
+# read_reconnect_count_from_pid 兼容读取 daemon.pid 的 reconnect_count 字段
+# - v0.2+ JSON 格式 ({"pid":...,"reconnect_count":N}) → 返回 N
+# - v0.1.x legacy 单行 PID (json.loads 返回 int) → 返回 0
+# - 文件不存在/格式错 → 返回 0
+# 用 stdout 输出数字；绝不 die，避免 set -e 下 $() 捕获时退出整条脚本
+read_reconnect_count_from_pid() {
+    local pid_file="$1"
+    [ -f "$pid_file" ] || { echo 0; return 0; }
+    python3 - "$pid_file" 2>/dev/null <<'PYEOF' || echo 0
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        raw = f.read().strip()
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        print(0); sys.exit(0)
+    if isinstance(d, dict):
+        print(d.get('reconnect_count', 0))
+    else:
+        print(0)
+except Exception:
+    print(0)
+PYEOF
+}
+
 real_backup() {
     BACKUP_DIR=$(mktemp -d -t clb-e2e-backup.XXXXXX)
     step "备份用户现有状态到 $BACKUP_DIR"
@@ -135,22 +163,37 @@ real_backup() {
         cp "$HOME/.cursor/cursor-lark-bridge/daemon.pid" "$BACKUP_DIR/daemon.pid.original"
         ok "已备份现有 daemon.pid"
     fi
+    local user_daemon_bin="$HOME/.cursor/cursor-lark-bridge/daemon/cursor-lark-bridge-daemon"
+    if [ -f "$user_daemon_bin" ]; then
+        cp "$user_daemon_bin" "$BACKUP_DIR/daemon.bin.original"
+        ok "已备份现有 daemon 二进制"
+    fi
 }
 
 real_restore() {
     [ -n "$BACKUP_DIR" ] || return 0
     step "恢复用户原有状态"
-    # 先把 e2e 装的 plist 卸掉
+    # 先把 e2e 装的 plist 卸掉，确保没有 launchd 在抓着 daemon 二进制
     if [ -f "$HOME/Library/LaunchAgents/com.cursor.feishu-bridge.plist" ]; then
         launchctl unload "$HOME/Library/LaunchAgents/com.cursor.feishu-bridge.plist" 2>/dev/null || true
         rm -f "$HOME/Library/LaunchAgents/com.cursor.feishu-bridge.plist"
     fi
-    # 恢复
+    # 确保没有残留 daemon 进程抓着二进制（否则 cp 会被占住）
+    pkill -9 cursor-lark-bridge-daemon 2>/dev/null || true
+    sleep 1
+    # 先恢复 daemon 二进制（要在 launchctl load 之前，避免 load 后立刻跑新二进制）
+    local user_daemon_bin="$HOME/.cursor/cursor-lark-bridge/daemon/cursor-lark-bridge-daemon"
+    if [ -f "$BACKUP_DIR/daemon.bin.original" ]; then
+        cp "$BACKUP_DIR/daemon.bin.original" "$user_daemon_bin"
+        ok "已恢复原有 daemon 二进制"
+    fi
+    # 恢复 plist + reload
     if [ -f "$BACKUP_DIR/plist.original" ]; then
         cp "$BACKUP_DIR/plist.original" "$HOME/Library/LaunchAgents/com.cursor.feishu-bridge.plist"
         launchctl load "$HOME/Library/LaunchAgents/com.cursor.feishu-bridge.plist" 2>/dev/null || true
         ok "已恢复原有 plist 并重新 load"
     fi
+    # 恢复 daemon.pid
     if [ -f "$BACKUP_DIR/daemon.pid.original" ]; then
         cp "$BACKUP_DIR/daemon.pid.original" "$HOME/.cursor/cursor-lark-bridge/daemon.pid"
         ok "已恢复原有 daemon.pid"
@@ -164,14 +207,22 @@ run_real_tests() {
 
     real_confirm_or_exit
 
-    # 先确保最新代码被编译 + 部署到 $BRIDGE_DIR
     local bridge_dir="$HOME/.cursor/cursor-lark-bridge"
     local daemon_bin="$bridge_dir/daemon/cursor-lark-bridge-daemon"
 
-    [ -f "$daemon_bin" ] || die "期待在 $daemon_bin 有已编译好的 daemon（请先 \`fb kill; cd daemon && go build -o $daemon_bin .\` 或跑 install.sh 部署）"
-
     real_backup
     trap real_restore EXIT
+
+    # 关键：用本分支代码重新编译并部署 daemon。否则 launchd 接管的仍是 install.sh
+    # 装的历史二进制，pid 格式、reconnect_count 等 V2 新行为都测不到。
+    step "用本分支代码编译并部署 daemon 到 $daemon_bin"
+    mkdir -p "$(dirname "$daemon_bin")"
+    # 为了可观测，把 e2e 部署出来的 version 标记成 "e2e-<时间戳>"，
+    # 一眼能在 fb status 里和 install.sh 装的版本（如 0.1.4）区分
+    local e2e_ver="e2e-$(date +%Y%m%d-%H%M%S)"
+    (cd "$REPO_ROOT/daemon" && go build -ldflags="-X main.version=${e2e_ver}" -o "$daemon_bin" .) \
+        || die "daemon 编译失败"
+    ok "已部署本分支 daemon（版本：${e2e_ver}）"
 
     step "fb service install"
     bash "$REPO_ROOT/scripts/bridge.sh" service install || die "fb service install 失败"
@@ -185,17 +236,18 @@ run_real_tests() {
         || die "/health 不可达"
     ok "/health 可达"
 
-    step "记录当前 reconnect_count（用于验证后面确实拉起了新进程）"
+    step "确认 daemon 是本分支编译的（而非旧 install.sh 版）"
+    local running_ver
+    running_ver=$(curl -fsS --max-time 3 http://127.0.0.1:19836/health 2>/dev/null \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('version',''))" 2>/dev/null)
+    if [ "$running_ver" != "${e2e_ver}" ]; then
+        die "期待 daemon 版本 ${e2e_ver}，实际 '${running_ver}'；部署没生效，测试无效"
+    fi
+    ok "daemon 版本 = ${running_ver}（本分支代码）"
+
+    step "记录当前 reconnect_count"
     local initial_rc
-    initial_rc=$(python3 -c "
-import json, sys
-try:
-    with open('$HOME/.cursor/cursor-lark-bridge/daemon.pid') as f:
-        d = json.load(f)
-    print(d.get('reconnect_count', 0))
-except Exception:
-    print(0)
-" 2>/dev/null)
+    initial_rc=$(read_reconnect_count_from_pid "$HOME/.cursor/cursor-lark-bridge/daemon.pid")
     ok "当前 reconnect_count = $initial_rc"
 
     step "pkill -9 daemon (模拟崩溃)"
@@ -212,15 +264,10 @@ except Exception:
 
     step "验证 reconnect_count 已增加（新进程 fresh start）"
     local new_rc
-    new_rc=$(python3 -c "
-import json, sys
-with open('$HOME/.cursor/cursor-lark-bridge/daemon.pid') as f:
-    d = json.load(f)
-print(d.get('reconnect_count', 0))
-")
-    # 新进程冷启动 rc 从 1 开始（P0.4 spec：每次尝试前 +1）
+    new_rc=$(read_reconnect_count_from_pid "$HOME/.cursor/cursor-lark-bridge/daemon.pid")
+    # 新进程冷启动会通过 supervisor updatePIDFile 让 rc >= 1（P0.4 语义：每次尝试前 +1）
     if [ "$new_rc" -lt 1 ]; then
-        die "新进程的 reconnect_count 应 >= 1，实际 $new_rc"
+        die "新进程的 reconnect_count 应 >= 1，实际 '$new_rc'"
     fi
     ok "新进程 reconnect_count=$new_rc（冷启动后 fresh PIDInfo）"
 
