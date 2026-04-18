@@ -45,11 +45,41 @@ type State struct {
 
 // ── Daemon ──
 
-// pendingEntry 把等待回复的 channel 和发起请求的 Agent 标识绑在一起，
-// 方便按钮回执卡片上也能正确显示 Agent 身份
+// pendingEntry 把等待回复的 channel、发起请求的 Agent 标识以及
+// /status 斜杠命令需要的 metadata（kind/summary/workspace 等）绑在一起
+//
+// 字段分两层：
+//   - reply：内部通信 channel，不对外暴露（只走 dispatch*Reply 通路）
+//   - 其余字段：面向 /status 的 PendingView 快照，创建时就定格，
+//     不会在生命周期内被修改，所以 snapshotPending 只需拷贝结构体值
 type pendingEntry struct {
-	reply chan string
-	agent string
+	reply     chan string
+	id        string
+	kind      string // shell / mcp / ask / stop / 其它，供 /status 分类展示
+	summary   string // 简短描述（命令/工具名/问题，单行，脱敏）
+	workspace string // 项目 basename，可空
+	agent     string
+	createdTS int64 // Unix 秒，创建时间
+}
+
+// PendingView 是 pendingEntry 的只读快照，供 /status 斜杠命令或其它
+// 外部观察者安全读取，不暴露 reply channel，复制时也不持锁
+type PendingView struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind"`
+	Summary   string `json:"summary"`
+	Workspace string `json:"workspace,omitempty"`
+	Agent     string `json:"agent,omitempty"`
+	CreatedTS int64  `json:"created_ts"`
+}
+
+// pendingMeta 是 HTTP handler 注册 pending 时把 kind/summary/workspace/agent
+// 四元组一起传给 waitReply 的内部 helper，避免 waitReply 参数膨胀
+type pendingMeta struct {
+	kind      string
+	summary   string
+	workspace string
+	agent     string
 }
 
 type Daemon struct {
@@ -58,7 +88,7 @@ type Daemon struct {
 	state     *State
 	stateMu   sync.RWMutex
 	pending   map[string]*pendingEntry
-	pendingMu sync.Mutex
+	pendingMu sync.RWMutex // 写锁用于注册/删除；读锁用于 snapshotPending 等只读快照
 	reqSeq    atomic.Int64
 
 	// 事件订阅子进程（lark-cli event +subscribe）相关状态
@@ -105,6 +135,12 @@ type ApproveRequest struct {
 	Content string `json:"content"`
 	Context string `json:"context"`
 	Agent   string `json:"agent"` // Agent 标识（项目名 · #id），用于多会话并行时区分
+
+	// 以下字段是 P2 新增的 metadata，供 /status 斜杠命令展示使用
+	// 老 hook（未升级到 P2.2）不会发送这些字段，daemon 会从 Title/Content 兜底
+	Kind      string `json:"kind,omitempty"`      // shell / mcp（空时 fallback 为 Type）
+	Summary   string `json:"summary,omitempty"`   // 简短描述（空时从 Content/Title 兜底）
+	Workspace string `json:"workspace,omitempty"` // 项目 basename
 }
 
 type ApproveResponse struct {
@@ -117,6 +153,11 @@ type AskRequest struct {
 	Options  []string `json:"options"`
 	Context  string   `json:"context"`
 	Agent    string   `json:"agent"` // Agent 标识
+
+	// P2 新增 metadata（同 ApproveRequest 的语义）
+	Kind      string `json:"kind,omitempty"`      // 空时默认 "ask"
+	Summary   string `json:"summary,omitempty"`   // 空时 fallback 为 Question
+	Workspace string `json:"workspace,omitempty"` // 项目 basename
 }
 
 type AskResponse struct {
@@ -134,9 +175,13 @@ type NotifyRequest struct {
 // Agent 停止 hook 的请求体：展示 Agent 最后输出，等待用户决定是否继续
 type StopRequest struct {
 	Status    string `json:"status"`     // completed / aborted / error
-	Summary   string `json:"summary"`    // Agent 最后输出摘要
+	Summary   string `json:"summary"`    // Agent 最后输出摘要（P2 之前就有，这里不重复声明）
 	LoopCount int    `json:"loop_count"` // stop hook 的循环计数
 	Agent     string `json:"agent"`      // Agent 标识
+
+	// P2 新增 metadata；Summary 已存在故不重复声明
+	Kind      string `json:"kind,omitempty"`      // 空时默认 "stop"
+	Workspace string `json:"workspace,omitempty"` // 项目 basename
 }
 
 // Agent 停止 hook 的响应体
@@ -581,10 +626,18 @@ func (d *Daemon) dispatchTextReply(text string) {
 	logInfo("无等待中的请求，丢弃回复: %s", truncate(text, 50))
 }
 
-func (d *Daemon) waitReply(requestID, agent string, timeout time.Duration) (string, error) {
+// waitReply 注册一个 pending 条目，阻塞等待来自 lark 的按钮/文字回复
+// 或 timeout 超时。meta 里的 kind/summary/workspace/agent 会一起存进
+// pendingEntry，方便 /status 斜杠命令快照时展示。
+func (d *Daemon) waitReply(requestID string, meta pendingMeta, timeout time.Duration) (string, error) {
 	entry := &pendingEntry{
-		reply: make(chan string, 1),
-		agent: agent,
+		reply:     make(chan string, 1),
+		id:        requestID,
+		kind:      meta.kind,
+		summary:   meta.summary,
+		workspace: meta.workspace,
+		agent:     meta.agent,
+		createdTS: time.Now().Unix(),
 	}
 	d.pendingMu.Lock()
 	d.pending[requestID] = entry
@@ -602,6 +655,31 @@ func (d *Daemon) waitReply(requestID, agent string, timeout time.Duration) (stri
 	case <-time.After(timeout):
 		return "", fmt.Errorf("等待回复超时 (%v)", timeout)
 	}
+}
+
+// snapshotPending 在读锁下拷贝一份 pending map 的只读 view 列表。
+// 用 RLock 而非 Lock 的目的是：/status 斜杠命令可能被频繁调用，
+// 读锁允许多个 snapshot 并发进行，不阻塞 waitReply 注册新 pending
+// 以外的读路径（dispatch*Reply 仍持写锁，所以写路径不受影响）。
+//
+// 由于 pendingEntry 的 metadata 字段（id/kind/summary/workspace/agent/createdTS）
+// 在 waitReply 创建后不会被修改，这里直接把值拷贝到 PendingView 即可，
+// 无需再加 entry 级别的锁。
+func (d *Daemon) snapshotPending() []PendingView {
+	d.pendingMu.RLock()
+	defer d.pendingMu.RUnlock()
+	views := make([]PendingView, 0, len(d.pending))
+	for _, e := range d.pending {
+		views = append(views, PendingView{
+			ID:        e.id,
+			Kind:      e.kind,
+			Summary:   e.summary,
+			Workspace: e.workspace,
+			Agent:     e.agent,
+			CreatedTS: e.createdTS,
+		})
+	}
+	return views
 }
 
 // ── lark-cli 发消息 ──
@@ -698,7 +776,27 @@ func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reply, err := d.waitReply(requestID, req.Agent, approveTimeout)
+	// 构造 pending metadata：老 hook（未升级到 P2.2）不发 Kind/Summary，
+	// 这里按优先级 Kind→Type、Summary→Content→Title 兜底
+	kind := req.Kind
+	if kind == "" {
+		kind = req.Type
+	}
+	summary := req.Summary
+	if summary == "" {
+		summary = summarizeOneLine(req.Content, 80)
+	}
+	if summary == "" {
+		summary = req.Title
+	}
+	meta := pendingMeta{
+		kind:      kind,
+		summary:   summary,
+		workspace: req.Workspace,
+		agent:     req.Agent,
+	}
+
+	reply, err := d.waitReply(requestID, meta, approveTimeout)
 	if err != nil {
 		logErr("等待审批回复失败: %v", err)
 		writeJSON(w, ApproveResponse{Decision: "allow"})
@@ -728,7 +826,23 @@ func (d *Daemon) handleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reply, err := d.waitReply(requestID, req.Agent, approveTimeout)
+	// ask 的 kind 默认就是 "ask"；summary fallback 为 Question 截到 80 字
+	kind := req.Kind
+	if kind == "" {
+		kind = "ask"
+	}
+	summary := req.Summary
+	if summary == "" {
+		summary = summarizeOneLine(req.Question, 80)
+	}
+	meta := pendingMeta{
+		kind:      kind,
+		summary:   summary,
+		workspace: req.Workspace,
+		agent:     req.Agent,
+	}
+
+	reply, err := d.waitReply(requestID, meta, approveTimeout)
 	if err != nil {
 		logErr("等待提问回复失败: %v", err)
 		httpErr(w, "timeout", http.StatusGatewayTimeout)
@@ -777,7 +891,24 @@ func (d *Daemon) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reply, err := d.waitReply(requestID, req.Agent, approveTimeout)
+	// stop 的 kind 默认 "stop"；summary 已由 hook 传入（Agent 最后输出），
+	// 空时 fallback 用 Status 字段（completed/aborted/error）
+	kind := req.Kind
+	if kind == "" {
+		kind = "stop"
+	}
+	summary := summarizeOneLine(req.Summary, 80)
+	if summary == "" {
+		summary = req.Status
+	}
+	meta := pendingMeta{
+		kind:      kind,
+		summary:   summary,
+		workspace: req.Workspace,
+		agent:     req.Agent,
+	}
+
+	reply, err := d.waitReply(requestID, meta, approveTimeout)
 	if err != nil {
 		// 超时当作"结束会话"，不注入 followup
 		logInfo("stop hook 等待回复超时，按结束处理")
@@ -1090,6 +1221,14 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// summarizeOneLine 把多行 lark_md 内容压成一行（换行变空格），再截到 n 字，
+// 给 pending metadata 的 summary fallback 用
+func summarizeOneLine(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.TrimSpace(s)
+	return truncate(s, n)
 }
 
 func boolStr(b bool, t, f string) string {
