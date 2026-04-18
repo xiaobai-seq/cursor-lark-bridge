@@ -1126,6 +1126,17 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 // ── main ──
 
 func main() {
+	baseDir := filepath.Join(homeDir(), ".cursor", "cursor-lark-bridge")
+	dl, err := setupLogging(baseDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[FATAL] setup logging: %v\n", err)
+		os.Exit(1)
+	}
+	// 把 log 包输出接到 dailyLogger + stderr 双路：stderr 兜底 launchd/nohup 捕获，
+	// dailyLogger 产出 logs/daemon-YYYY-MM-DD.log
+	log.SetOutput(io.MultiWriter(os.Stderr, dl))
+	defer dl.Close()
+
 	logInfo("cursor-lark-bridge daemon 启动中... (version=%s)", version)
 	d := newDaemon()
 	if err := d.acquirePIDLock(); err != nil {

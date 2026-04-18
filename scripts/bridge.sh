@@ -152,14 +152,27 @@ start_daemon() {
 
     build_daemon
     echo -e "${BLUE}启动 daemon...${NC}"
-    mkdir -p "$BRIDGE_DIR"
-    nohup "$DAEMON_BIN" >> "$LOG_FILE" 2>&1 &
+    mkdir -p "$BRIDGE_DIR/logs"
+    # 手动 nohup 路径也用 logs/launchd-stderr.log，和 launchd 托管路径对齐，
+    # 避免两种启动方式写到不同文件造成排查时遗漏
+    nohup "$DAEMON_BIN" >> "$BRIDGE_DIR/logs/launchd-stderr.log" 2>&1 &
     sleep 1
     if is_daemon_running; then
         echo -e "${GREEN}daemon 已启动 (PID=$(cat "$PID_FILE"))${NC}"
     else
-        echo -e "${RED}daemon 启动失败，查看日志: $LOG_FILE${NC}"
-        tail -5 "$LOG_FILE" 2>/dev/null | sed 's/^/    /'
+        # 智能挑选最可能有错误信息的日志：今天的 daemon-YYYY-MM-DD.log
+        # 优先（新版按天滚动），回落到 nohup/launchd 的 stderr 抓取，
+        # 最后兼容尚未重启过的老实例仍写在 $LOG_FILE 里的情况
+        local today_log="$BRIDGE_DIR/logs/daemon-$(date +%Y-%m-%d).log"
+        local launchd_err="$BRIDGE_DIR/logs/launchd-stderr.log"
+        echo -e "${RED}daemon 启动失败${NC}"
+        for candidate in "$today_log" "$launchd_err" "$LOG_FILE"; do
+            if [ -f "$candidate" ]; then
+                echo -e "  ${BLUE}日志：$candidate${NC}"
+                tail -5 "$candidate" 2>/dev/null | sed 's/^/    /'
+                break
+            fi
+        done
         exit 1
     fi
 }
