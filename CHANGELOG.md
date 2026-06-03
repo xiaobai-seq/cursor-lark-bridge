@@ -2,6 +2,22 @@
 
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 规范。版本遵循 [SemVer 2.0](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1] - 2026-06-03
+
+修复企业代理环境下飞书静默收不到消息的问题，并补上对应的诊断能力。纯脚本改动，daemon 二进制与 `hooks.json` 契约不变。
+
+### Fixed
+
+- **企业代理劫持本地回环，导致飞书完全收不到消息**：`fb` 与各 hook 发往本地 daemon（`127.0.0.1:19836`）的 curl / Python urllib 请求，在设置了 `http_proxy` / `all_proxy` 且 `no_proxy` 未覆盖 `127.0.0.1` 的环境下被企业代理劫持（代理回不了本机回环 → 502），造成 `fb start` 假激活、hook 发不出卡片，而 `fb doctor` 仍报“未发现异常”。`scripts/bridge.sh` 与 4 个调用 daemon 的 hook（`shell-approve.sh` / `mcp-approve.sh` / `pretool-approve.sh` / `on-stop.sh`）顶部注入 `no_proxy=127.0.0.1,localhost,::1`（保留用户既有配置），让 curl 与子进程 urllib 直连回环；daemon 出站发飞书的外网请求继续走代理、不受影响。
+
+### Added
+
+- **`fb doctor` 新增 `[6/6]` 代理体检**：用 `--noproxy '*'`（强制直连）对比 `--noproxy ''`（强制走代理）实测 `/health` 是否被劫持，判定代理是否会劫持本地回环；并检测已安装 hook 是否仍是未绕过代理的旧版，给出重装修复指引。补齐了“进程 / 端口都正常却收不到消息”的诊断盲区。
+
+### 向前兼容
+
+- 纯脚本改动，daemon 二进制与 `hooks.json` 契约均不变；存量用户重跑 `install.sh` + `fb start` 即可，`open_id` 配置保留。
+
 ## [0.2.0] - 2026-04-18
 
 运维硬化 + 飞书斜杠命令。整体保持 v0.1.x 的 Hook 模型不变（现有 `~/.cursor/hooks/cursor-lark-bridge/` 全部保留），所有升级都在 daemon 和 `bridge.sh` 内部完成，无需修改 `hooks.json`。
@@ -51,5 +67,6 @@
 
 ---
 
+[0.2.1]: https://github.com/xiaobai-seq/cursor-lark-bridge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/xiaobai-seq/cursor-lark-bridge/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/xiaobai-seq/cursor-lark-bridge/releases/tag/v0.1.5
