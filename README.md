@@ -18,7 +18,7 @@ Cursor hooks are powerful but local. If you walk away from your laptop, the Agen
 - **Card + text fallback** – click `✅ Approve` / `❌ Deny` or just type a reply.
 - **Multi-agent safe** – each card shows a per-conversation label (`project · #abcd123`); override with `FEISHU_BRIDGE_AGENT_LABEL=...`.
 - **Self-healing daemon** – PID lock prevents double daemons, child `lark-cli` lives in its own process group and dies with the daemon, stderr-driven auto-recovery from `already running` conflicts, real three-tier health probe (`subscribe_ok` / `last_event_age_ms` / `restart_count`).
-- **Built-in diagnostics** – `fb doctor [--fix]` checks five classes of real-world breakage (legacy processes, lark-cli orphans, PID drift, port 19836, duplicate hook entries) and can auto-repair all of them.
+- **Built-in diagnostics** – `fb doctor [--fix]` checks six classes of real-world breakage (legacy processes, lark-cli orphans, PID drift, port 19836, duplicate hook entries, **proxy hijacking loopback**) and can auto-repair most of them.
 - **Idempotent installer** – `install.sh` is safe to re-run, and `fb init` merges into your existing `~/.cursor/hooks.json` with a diff preview and backup.
 - **Zero third-party Go deps** – stdlib only; binary < 6 MB.
 - **Offline-friendly** – no data leaves your machine except the Feishu messages the daemon itself sends.
@@ -209,6 +209,7 @@ At runtime the installer lays things out under:
 |---|---|---|
 | `未找到 config.json` on `fb start` | never initialized | `fb init` |
 | Feishu receives no cards at all | event subscribe is not running | `fb status` — if `event subscribe` is `not running` / `unstable`, run `fb doctor --fix`; if `lark-cli` itself is not authenticated, run `lark-cli auth login` |
+| **`fb doctor` is all-green and processes are up, yet Feishu receives nothing** | your shell / Cursor environment sets a corporate proxy (`http_proxy` / `all_proxy`, …) and `no_proxy` does not cover `127.0.0.1`, so loopback requests to the local daemon get hijacked by the proxy — `fb start` silently no-ops and hooks can't deliver cards | upgrade to the latest version: `curl -fsSL <install.sh> \| bash` then `fb start`. The new `fb` and all hooks auto-bypass the proxy for loopback, and `fb doctor` step `[6/6]` now pinpoints this directly |
 | **Messages stop arriving after the screen has been off for a while** | a previous crash left a `lark-cli event +subscribe` orphan holding the "one-subscriber-per-app" slot, so every subsequent reconnect is rejected | `fb doctor --fix` — kills the orphan and the daemon reconnects automatically |
 | **Every interaction delivers two authorization cards and the second card's buttons do nothing** | `~/.cursor/hooks.json` contains both the old `hooks/feishu-bridge/*` entries and the new `hooks/cursor-lark-bridge/*` entries; Cursor only awaits the **first** hook's response, so the second card's button events are discarded | `fb doctor --fix` — backs up `hooks.json`, removes the stale entries, and deletes the old `hooks/feishu-bridge/` directory |
 | `HTTP 400: open_id cross app` in `daemon.log` | the `open_id` in `config.json` was issued by a different app than the one `lark-cli` is currently bound to | `fb init --force` to re-detect under the current app |
@@ -222,11 +223,12 @@ Full log: `~/.cursor/cursor-lark-bridge/daemon.log`.
 ### What `fb doctor` actually checks
 
 ```text
-[1/5] legacy feishu-bridge processes   → they would steal port 19836
-[2/5] lark-cli event subscribers       → expect exactly 2 (node shim + real binary); more = orphans
-[3/5] PID file consistency             → prevents `fb` from misreading daemon state
-[4/5] whoever is listening on 19836    → a non-bridge occupant makes the new daemon's bind fail
-[5/5] stale feishu-bridge entries in hooks.json  → root cause of the "two cards, second inert" bug
+[1/6] legacy feishu-bridge processes   → they would steal port 19836
+[2/6] lark-cli event subscribers       → expect exactly 2 (node shim + real binary); more = orphans
+[3/6] PID file consistency             → prevents `fb` from misreading daemon state
+[4/6] whoever is listening on 19836    → a non-bridge occupant makes the new daemon's bind fail
+[5/6] stale feishu-bridge entries in hooks.json  → root cause of the "two cards, second inert" bug
+[6/6] proxy hijacking loopback 127.0.0.1  → corporate proxy + no_proxy missing 127.0.0.1 makes fb/hooks unable to reach the daemon
 ```
 
 Process scans filter out shell interpreters via `ps -o comm=`, so even if the doctor script's own `cmdline` contains the literal string `feishu-bridge-daemon`, it will never match itself.

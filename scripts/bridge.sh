@@ -12,6 +12,15 @@
 
 set -u
 
+# ── 强制本地回环绕过代理 ──────────────────────────────────────────────
+# 与 daemon 的全部通信都走回环地址 http://127.0.0.1:19836。企业代理环境下
+# （http_proxy/https_proxy/all_proxy 指向公司代理、且 no_proxy 未覆盖 127.0.0.1）
+# curl 会把回环请求也转发给代理，代理回不了本机环回 → 返回 502：于是 fb start 的
+# /mode 激活打不到 daemon、fb status 的 /health 解析失败而显示全默认值。这里把回环
+# 地址注入 no_proxy（保留用户已有配置），不影响 daemon 出站发飞书的外网请求。
+export no_proxy="127.0.0.1,localhost,::1${no_proxy:+,${no_proxy}}"
+export NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,${NO_PROXY}}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE_DIR="$HOME/.cursor/cursor-lark-bridge"
 HOOKS_DIR="$HOME/.cursor/hooks/cursor-lark-bridge"
@@ -470,7 +479,7 @@ cmd_doctor() {
     local fixes=()
 
     # 1. 老版 feishu-bridge 残留
-    echo -e "${BLUE}[1/5] 扫描老版 feishu-bridge 残留进程...${NC}"
+    echo -e "${BLUE}[1/6] 扫描老版 feishu-bridge 残留进程...${NC}"
     local legacy_pids
     legacy_pids=$(list_legacy_feishu_bridge_pids)
     if [ -n "$legacy_pids" ]; then
@@ -485,7 +494,7 @@ cmd_doctor() {
     fi
 
     # 2. lark-cli event 订阅进程（检查孤儿/缺失）
-    echo -e "${BLUE}[2/5] 扫描 lark-cli event 订阅进程...${NC}"
+    echo -e "${BLUE}[2/6] 扫描 lark-cli event 订阅进程...${NC}"
     local lark_pids lark_event_count
     lark_pids=$(list_matching_pids 'lark-cli.*event .subscribe')
     lark_event_count=$(echo -n "$lark_pids" | grep -c . || true)
@@ -516,7 +525,7 @@ cmd_doctor() {
     fi
 
     # 3. PID 文件一致性
-    echo -e "${BLUE}[3/5] 检查 PID 文件一致性...${NC}"
+    echo -e "${BLUE}[3/6] 检查 PID 文件一致性...${NC}"
     if [ -f "$PID_FILE" ]; then
         local pid_in_file
         pid_in_file=$(read_pid_from_file "$PID_FILE")
@@ -543,7 +552,7 @@ cmd_doctor() {
     fi
 
     # 4. 端口占用检测
-    echo -e "${BLUE}[4/5] 检查 19836 端口占用...${NC}"
+    echo -e "${BLUE}[4/6] 检查 19836 端口占用...${NC}"
     local port_holder
     port_holder=$(lsof -iTCP:19836 -sTCP:LISTEN -n -P 2>/dev/null | awk 'NR>1 {print $1"(PID="$2")"}' | head -1)
     if [ -n "$port_holder" ]; then
@@ -560,7 +569,7 @@ cmd_doctor() {
     fi
 
     # 5. hooks.json 里的重复条目（老 feishu-bridge + 新 cursor-lark-bridge 并存）
-    echo -e "${BLUE}[5/5] 扫描 hooks.json 是否有老版 feishu-bridge 残留条目...${NC}"
+    echo -e "${BLUE}[5/6] 扫描 hooks.json 是否有老版 feishu-bridge 残留条目...${NC}"
     local dup_count
     dup_count=$(scan_duplicate_hooks count)
     if [ "${dup_count:-0}" -gt 0 ]; then
@@ -571,6 +580,50 @@ cmd_doctor() {
         fixes+=("fb doctor --fix  # 将自动清理 hooks.json 与老 hooks 目录")
     else
         echo -e "  ${GREEN}✓${NC} hooks.json 无重复条目"
+    fi
+
+    # 6. 代理是否劫持本地回环。daemon 监听 127.0.0.1:19836（loopback）。企业代理环境下
+    #    （http_proxy/all_proxy 生效且 no_proxy 未覆盖 127.0.0.1），curl/urllib 会把回环请求
+    #    也转发给代理，代理回不了本机 → fb 激活打不到 daemon、hook 发不出卡片、status 显示全默认值。
+    #    这是个"doctor 之前看不到"的盲区：进程/端口都正常，却完全收不到飞书消息。
+    echo -e "${BLUE}[6/6] 检查代理是否劫持本地回环 (127.0.0.1:19836)...${NC}"
+    local proxy_set=""
+    for v in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do
+        [ -n "${!v:-}" ] && proxy_set="yes"
+    done
+    if [ -z "$proxy_set" ]; then
+        echo -e "  ${GREEN}✓${NC} 无代理环境变量，回环通信不受影响"
+    elif ! is_daemon_running; then
+        echo -e "  ${YELLOW}⚠${NC} 检测到代理但 daemon 未运行，启动后再跑 doctor 可实测是否被劫持"
+    else
+        # --noproxy '*' 强制直连、--noproxy '' 强制走代理，对比 /health 是否被劫持
+        local direct_ok viaproxy_ok
+        direct_ok=$(curl -s --connect-timeout 2 --noproxy '*' "$DAEMON_ADDR/health" 2>/dev/null \
+            | python3 -c "import sys,json;sys.exit(0 if json.load(sys.stdin).get('status')=='ok' else 1)" 2>/dev/null && echo ok || echo no)
+        viaproxy_ok=$(curl -s --connect-timeout 2 --noproxy '' "$DAEMON_ADDR/health" 2>/dev/null \
+            | python3 -c "import sys,json;sys.exit(0 if json.load(sys.stdin).get('status')=='ok' else 1)" 2>/dev/null && echo ok || echo no)
+        if [ "$direct_ok" = "ok" ] && [ "$viaproxy_ok" = "no" ]; then
+            # 代理确实会劫持回环。fb 自身已在脚本顶部注入 no_proxy 自保；
+            # 再确认已安装的 hook 也是绕过代理的新版，否则 Cursor 触发交互时仍发不出卡片。
+            local stale_hooks=""
+            for h in shell-approve.sh mcp-approve.sh pretool-approve.sh on-stop.sh; do
+                if [ -f "$HOOKS_DIR/$h" ] && ! grep -q 'no_proxy' "$HOOKS_DIR/$h" 2>/dev/null; then
+                    stale_hooks+="${stale_hooks:+ }$h"
+                fi
+            done
+            if [ -n "$stale_hooks" ]; then
+                issues=$((issues + 1))
+                echo -e "  ${RED}✗${NC} 代理会劫持本地回环，且以下 hook 仍是旧版（未绕过代理）：$stale_hooks"
+                echo -e "      ${YELLOW}→ Cursor 触发交互时这些 hook 连不上 daemon，飞书会收不到卡片。${NC}"
+                fixes+=("重装以同步最新脚本: curl -fsSL https://raw.githubusercontent.com/xiaobai-seq/cursor-lark-bridge/main/install.sh | bash  然后  fb start")
+            else
+                echo -e "  ${GREEN}✓${NC} 代理会劫持回环，但 fb 与全部 hook 均已自动绕过 (no_proxy 注入生效)"
+            fi
+        elif [ "$direct_ok" = "ok" ]; then
+            echo -e "  ${GREEN}✓${NC} 代理存在但未劫持回环 (proxy 放行了 127.0.0.1)"
+        else
+            echo -e "  ${YELLOW}⚠${NC} /health 直连也异常，问题多半不在代理（请看上面其它检查项）"
+        fi
     fi
 
     # 汇总
