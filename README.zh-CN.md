@@ -18,7 +18,7 @@ Cursor hooks 很强，但只在本地起作用。一旦你离开电脑，任何�
 - **卡片 + 文字双通道** – 点按钮 `✅ 批准` / `❌ 拒绝`，或者直接发消息。
 - **并行会话安全** – 每张卡片带短标识（`项目名 · #abcd123`），可用 `FEISHU_BRIDGE_AGENT_LABEL=...` 覆盖。
 - **daemon 自愈** – PID 锁杜绝多实例并存，子 `lark-cli` 独立进程组随 daemon 一起退出，stderr 驱动的冲突自动恢复，三档真实健康度探针（`subscribe_ok` / `last_event_age_ms` / `restart_count`）。
-- **内置诊断器** – `fb doctor [--fix]` 覆盖 5 类真实故障（老版残留进程、lark-cli 孤儿、PID 漂移、19836 端口占用、hooks 重复），可一键自愈。
+- **内置诊断器** – `fb doctor [--fix]` 覆盖 6 类真实故障（老版残留进程、lark-cli 孤儿、PID 漂移、19836 端口占用、hooks 重复、**代理劫持本地回环**），多数可一键自愈。
 - **幂等安装器** – `install.sh` 可重复执行，`fb init` 合并到 `~/.cursor/hooks.json` 时会展示 diff 并备份原文件。
 - **Go daemon 零第三方依赖** – 纯标准库，二进制 < 6 MB。
 - **本地闭环** – 除了 daemon 主动发给飞书的消息，没有任何数据离开你的机器。
@@ -193,6 +193,7 @@ cursor-lark-bridge/
 |---|---|---|
 | `fb start` 报 `未找到 config.json` | 从没跑过初始化 | `fb init` |
 | 飞书收不到卡片 | 事件订阅没跑起来 | `fb status`；若"事件订阅"为 `未运行` / `不稳定`，跑 `fb doctor --fix`；若 `lark-cli` 本身没登录，跑 `lark-cli auth login` |
+| **`fb doctor` 全绿、进程都在，但飞书就是收不到任何消息** | shell / Cursor 环境设了企业代理（`http_proxy` / `all_proxy` 等）且 `no_proxy` 没覆盖 `127.0.0.1`：发往本地 daemon 的回环请求被代理劫持，`fb start` 假激活、hook 发不出卡片 | 升级到最新版：`curl -fsSL <install.sh> \| bash` 然后 `fb start`。新版 `fb` 与全部 hook 会自动为本地回环绕过代理；`fb doctor` 的 `[6/6]` 也会直接定位这个问题 |
 | **电脑息屏一段时间后，消息就收不到了** | 上一次 daemon 非正常退出留下了 `lark-cli event +subscribe` 孤儿，霸占"一个 app 只能一个订阅者"的坑位，新启动的订阅始终拿不到 WebSocket | `fb doctor --fix`（会精确识别并清理孤儿，daemon 自动重连） |
 | **一次交互收到两张授权卡片，第二张的按钮点了没反应** | `~/.cursor/hooks.json` 里同时保留了老版 `hooks/feishu-bridge/*` 和新版 `hooks/cursor-lark-bridge/*` 条目，每次交互被触发两次；而 Cursor 只 wait **第一个**返回的 hook 结果，第二张卡片的按钮事件被丢弃 | `fb doctor --fix`（会备份 hooks.json，过滤掉老条目，删掉老目录） |
 | `daemon.log` 里出现 `HTTP 400: open_id cross app` | `config.json` 里的 `open_id` 和 `lark-cli` 当前绑定的应用不是同一个 | `fb init --force` 重新自动探测 |
@@ -206,11 +207,12 @@ cursor-lark-bridge/
 ### `fb doctor` 都检查什么
 
 ```text
-[1/5] 老版 feishu-bridge 残留进程        → 会抢 19836 端口，必须清
-[2/5] lark-cli event 订阅进程数         → 应当恰好是 2 个（node 壳 + 真二进制），多则为孤儿
-[3/5] PID 文件一致性                    → 防止 `fb` 误判 daemon 状态
-[4/5] 19836 端口谁在监听                → 非本 daemon 占用会让新 daemon bind 失败
-[5/5] hooks.json 是否有老版 feishu-bridge 条目  → 造成"两张卡片第二张无效"
+[1/6] 老版 feishu-bridge 残留进程        → 会抢 19836 端口，必须清
+[2/6] lark-cli event 订阅进程数         → 应当恰好是 2 个（node 壳 + 真二进制），多则为孤儿
+[3/6] PID 文件一致性                    → 防止 `fb` 误判 daemon 状态
+[4/6] 19836 端口谁在监听                → 非本 daemon 占用会让新 daemon bind 失败
+[5/6] hooks.json 是否有老版 feishu-bridge 条目  → 造成"两张卡片第二张无效"
+[6/6] 代理是否劫持本地回环 127.0.0.1     → 企业代理 + no_proxy 未覆盖回环时，fb/hook 连不上 daemon（飞书静默收不到消息）
 ```
 
 进程层面的扫描使用 `ps -o comm=` 过滤掉 `bash / sh / zsh` 等解释器，所以即便这个脚本自己的 `cmdline` 字面含 `feishu-bridge-daemon` 字符串，也不会误伤自己。

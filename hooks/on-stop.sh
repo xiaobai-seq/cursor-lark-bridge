@@ -11,6 +11,12 @@ DAEMON="http://127.0.0.1:19836"
 CACHE_FILE="$HOME/.cursor/cursor-lark-bridge/last-response.txt"
 HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# 本地回环绕过代理：hook 由 Cursor 进程拉起，继承企业代理 env；若不绕过，对
+# daemon(127.0.0.1:19836) 的 curl / python urllib 会被代理劫持而永远发不出卡片。
+# 注入 no_proxy 让 curl 和子进程的 urllib 都直连本地 daemon。
+export no_proxy="127.0.0.1,localhost,::1${no_proxy:+,${no_proxy}}"
+export NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,${NO_PROXY}}"
+
 input=$(cat)
 
 # 提取 Agent 标识（暂停卡片底部展示），便于多会话并行时区分
